@@ -104,7 +104,7 @@ async fn main() -> Result<(), String> {
     println!("Phase 2: Aggressive hidden SSID discovery");
     match aggressive_ssid_discovery(&interface_name) {
         Ok(hidden_mapping) => {
-\            for (mac, ssid) in hidden_mapping {
+            for (mac, ssid) in hidden_mapping {
                 mac_to_ssid.insert(mac, ssid);
             }
         },
@@ -162,7 +162,7 @@ async fn main() -> Result<(), String> {
                 for frame in &frames {
                     if let Some(payload) = &frame.payload {
                         if payload.len() > 0 {
-\                            let ap_name = if let Some(bssid) = &frame.bssid {
+                            let ap_name = if let Some(bssid) = &frame.bssid {
                                 if mac_to_ssid.contains_key(bssid) {
                                     format!("{} ({})", bssid, mac_to_ssid.get(bssid).unwrap())
                                 } else {
@@ -309,7 +309,7 @@ fn analyze_data_packet(frame: &parser::ParsedFrame) -> Vec<String> {
                 0x0800 => {
                     insights.push("IPv4 packet".to_string());
                     if payload.len() >= 20 + 8 {
-                        let ip_header_len = (payload[8] & 0x0F) * 4;
+                        let ip_header_len = (payload[8] & 0x0F) as usize * 4; 
                         let src_ip = format!("{}.{}.{}.{}", 
                                      payload[12+8], payload[13+8], payload[14+8], payload[15+8]);
                         let dst_ip = format!("{}.{}.{}.{}", 
@@ -317,13 +317,13 @@ fn analyze_data_packet(frame: &parser::ParsedFrame) -> Vec<String> {
                         insights.push(format!("Source IP: {}", src_ip));
                         insights.push(format!("Destination IP: {}", dst_ip));
                         
-                        if payload.len() >= 8 + ip_header_len + 4 {
+                        if payload.len() >= 8 + ip_header_len + 4 { 
                             let protocol = payload[9+8];
                             match protocol {
                                 6 => {
                                     insights.push("TCP packet".to_string());
-                                    if payload.len() >= 8 + ip_header_len + 4 {
-                                        let offset = 8 + ip_header_len as usize;
+                                    if payload.len() >= 8 + ip_header_len + 4 { 
+                                        let offset = 8 + ip_header_len; 
                                         let src_port = ((payload[offset] as u16) << 8) | (payload[offset+1] as u16);
                                         let dst_port = ((payload[offset+2] as u16) << 8) | (payload[offset+3] as u16);
                                         insights.push(format!("TCP Ports: {} → {}", src_port, dst_port));
@@ -346,8 +346,8 @@ fn analyze_data_packet(frame: &parser::ParsedFrame) -> Vec<String> {
                                 },
                                 17 => {
                                     insights.push("UDP packet".to_string());
-                                    if payload.len() >= 8 + ip_header_len + 4 {
-                                        let offset = 8 + ip_header_len as usize;
+                                    if payload.len() >= 8 + ip_header_len + 4 { // And this one
+                                        let offset = 8 + ip_header_len;
                                         let src_port = ((payload[offset] as u16) << 8) | (payload[offset+1] as u16);
                                         let dst_port = ((payload[offset+2] as u16) << 8) | (payload[offset+3] as u16);
                                         insights.push(format!("UDP Ports: {} → {}", src_port, dst_port));
