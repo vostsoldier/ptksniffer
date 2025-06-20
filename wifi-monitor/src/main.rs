@@ -10,6 +10,7 @@ mod parser;
 mod capture;
 mod display;
 mod web;
+mod decryption;
 
 use interface::WifiInterface;
 use parser::{capture_and_parse, get_access_points};
@@ -17,6 +18,8 @@ use display::{display_results, log_to_file};
 use std::collections::HashMap;
 use parser::FrameType;
 use parser::ManagementSubtype;
+use decryption::Decryptor;
+use std::io::{self, Write};
 
 #[cfg(unix)]
 extern crate libc;
@@ -113,6 +116,10 @@ async fn main() -> Result<(), String> {
         }
     };
 
+    // Set up decryption
+    println!("Setting up decryption capabilities...");
+    let mut decryptor = setup_decryption();
+
     println!("Starting packet capture (press Ctrl+C to stop)...");
     loop {
         match capture_and_parse(&interface_name, 5000, None) { 
@@ -186,6 +193,73 @@ async fn main() -> Result<(), String> {
                             println!("  Payload (first 48 bytes):");
                             print_hex_dump(&payload[..std::cmp::min(48, payload.len())]);
                             println!();
+                        }
+                    }
+                }
+
+                // Process for decryption
+                for frame in &frames {
+                    // Display decrypted data
+                    if let Some(decrypted) = decryptor.process_packet(frame, &mac_to_ssid) {
+                        println!("\n DECRYPTED PACKET: {} → {} via {}", 
+                                frame.mac_src, frame.mac_dst, 
+                                frame.bssid.as_ref().unwrap_or(&"Unknown".to_string()));
+                        println!("  Original Length: {} bytes, Decrypted Length: {} bytes", 
+                                frame.frame_length, decrypted.len());
+                        
+                        println!("  Decrypted Data Hex Dump:");
+                        print_hex_dump(&decrypted[..std::cmp::min(64, decrypted.len())]);
+                        
+                        println!("\n  Decrypted Text:");
+                        let printable: String = decrypted.iter()
+                            .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
+                            .collect();
+                        println!("    {}", printable);
+                        
+                        if decrypted.len() >= 14 {
+                            let eth_type = ((decrypted[12] as u16) << 8) | (decrypted[13] as u16);
+                            match eth_type {
+                                0x0800 => {
+                                    println!("  IPv4 Packet");
+                                    if decrypted.len() >= 34 {
+                                        let src_ip = format!("{}.{}.{}.{}", 
+                                                    decrypted[26], decrypted[27], decrypted[28], decrypted[29]);
+                                        let dst_ip = format!("{}.{}.{}.{}", 
+                                                    decrypted[30], decrypted[31], decrypted[32], decrypted[33]);
+                                        println!("    Source IP: {}", src_ip);
+                                        println!("    Destination IP: {}", dst_ip);
+                                        
+                                        let ip_header_len = (decrypted[14] & 0x0F) * 4;
+                                        let protocol = decrypted[23];
+                                        match protocol {
+                                            6 => {
+                                                println!("    TCP Packet");
+                                                if decrypted.len() >= 14 + ip_header_len as usize + 4 {
+                                                    let tcp_offset = 14 + ip_header_len as usize;
+                                                    let src_port = ((decrypted[tcp_offset] as u16) << 8) | 
+                                                                  (decrypted[tcp_offset+1] as u16);
+                                                    let dst_port = ((decrypted[tcp_offset+2] as u16) << 8) | 
+                                                                  (decrypted[tcp_offset+3] as u16);
+                                                    println!("    Ports: {} → {}", src_port, dst_port);
+                                                    
+                                                    match dst_port {
+                                                        80 => println!("    HTTP Traffic"),
+                                                        443 => println!("    HTTPS Traffic"),
+                                                        53 => println!("    DNS Traffic"),
+                                                        _ => {}
+                                                    }
+                                                }
+                                            },
+                                            17 => println!("    UDP Packet"),
+                                            1 => println!("    ICMP Packet"),
+                                            _ => println!("    Protocol: {}", protocol),
+                                        }
+                                    }
+                                },
+                                0x0806 => println!("  ARP Packet"),
+                                0x86DD => println!("  IPv6 Packet"),
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -523,4 +597,41 @@ fn aggressive_ssid_discovery(interface_name: &str) -> Result<HashMap<String, Str
              mac_to_ssid.values().filter(|s| s.contains("probable")).count());
     
     Ok(mac_to_ssid)
+}
+
+// Function for decryption 
+fn setup_decryption() -> Decryptor {
+    let mut decryptor = Decryptor::new();
+    
+    println!("\n--- WiFi Decryption Setup ---");
+    println!("To decrypt traffic, you need to provide the SSID and password for networks you own.");
+    println!("Note: You can only decrypt traffic for networks where you know the password.");
+    
+    loop {
+        print!("\nEnter network SSID (or leave empty to finish): ");
+        io::stdout().flush().unwrap();
+        let mut ssid = String::new();
+        io::stdin().read_line(&mut ssid).expect("Failed to read input");
+        let ssid = ssid.trim();
+        
+        if ssid.is_empty() {
+            break;
+        }
+        
+        print!("Enter network password: ");
+        io::stdout().flush().unwrap();
+        let mut password = String::new();
+        io::stdin().read_line(&mut password).expect("Failed to read input");
+        let password = password.trim();
+        
+        if !password.is_empty() {
+            decryptor.add_network(ssid, password);
+        }
+    }
+    
+    println!("Decryption setup complete.");
+    println!("Looking for 4-way handshakes to enable decryption...");
+    println!("Note: Full decryption requires capturing a complete WPA handshake.");
+    
+    decryptor
 }

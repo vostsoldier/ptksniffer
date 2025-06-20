@@ -262,32 +262,33 @@ fn extract_ssid(frame_data: &[u8]) -> Option<String> {
         let tag_number = frame_data[pos];
         let tag_length = frame_data[pos + 1] as usize;
         
-        if tag_number == 0 { 
+        if tag_number == 0 { // SSID element
             if tag_length == 0 {
                 return Some("<hidden>".to_string());
             } else if pos + 2 + tag_length <= frame_data.len() {
                 let ssid_bytes = &frame_data[pos + 2..pos + 2 + tag_length];
                 
                 if let Ok(ssid) = String::from_utf8(ssid_bytes.to_vec()) {
-                    if !ssid.trim().is_empty() {
-                        return Some(ssid);
-                    }
+                    return Some(ssid);
                 }
                 
-                let readable_ssid: String = ssid_bytes.iter()
-                    .map(|&b| if b >= 32 && b <= 126 { b as char } else { '?' })
+                let ascii_ssid: String = ssid_bytes.iter()
+                    .map(|&b| {
+                        if b >= 32 && b <= 126 { 
+                            b as char
+                        } else {
+                            match b {
+                                0 => '␀',
+                                9 => '␉',
+                                10 => '␊',
+                                13 => '␍',
+                                _ => '•'
+                            }
+                        }
+                    })
                     .collect();
                 
-                let question_count = readable_ssid.chars().filter(|&c| c == '?').count();
-                if question_count < readable_ssid.len() / 2 {
-                    return Some(format!("{} (non-UTF8)", readable_ssid));
-                } else {
-                    let hex_ssid = ssid_bytes.iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<String>>()
-                        .join("");
-                    return Some(format!("HEX[{}]", hex_ssid));
-                }
+                return Some(format!("{} (special chars)", ascii_ssid));
             }
         }
         
