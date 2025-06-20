@@ -61,7 +61,7 @@ impl Decryptor {
     pub fn process_packet(&mut self, frame: &ParsedFrame, ssid_map: &HashMap<String, String>) -> Option<Vec<u8>> {
         if let Some(payload) = &frame.payload {
             if self.is_eapol_frame(payload) {
-                if let (Some(bssid), Some(_)) = (&frame.bssid, &frame.mac_src) {
+                if let Some(bssid) = &frame.bssid {
                     let client_mac = &frame.mac_src;
                     if let Some(handshake_info) = self.extract_handshake_info(bssid, client_mac, payload) {
                         self.add_handshake(handshake_info);
