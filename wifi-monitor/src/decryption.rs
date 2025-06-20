@@ -340,6 +340,10 @@ impl Decryptor {
             println!("🔓 Attempting to decrypt packet:");
             println!("  ↪ Packet number (PN): {:02x?}", pn);
             
+            let encrypted_data = &payload[8..payload.len()-8];
+            
+            let mic = &payload[payload.len()-8..]; 
+            
             // Construct the nonce (13 bytes)
             let mut nonce = [0u8; 13];
             nonce[0] = 0; 
@@ -426,9 +430,9 @@ impl Decryptor {
             
             // Try to decrypt
             let mut tag = [0u8; 8]; 
-            tag.copy_from_slice(mic);
+            tag.copy_from_slice(mic); 
             
-            let mut decrypted = encrypted_data.to_vec();
+            let mut decrypted = encrypted_data.to_vec(); 
             
             let cipher = match Aes128Ccm::new_from_slice(&keys.tk) {
                 Ok(c) => c,
