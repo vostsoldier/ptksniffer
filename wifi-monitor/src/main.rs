@@ -89,6 +89,7 @@ async fn main() -> Result<(), String> {
     });
 
     // Initialize and start the web server in a separate thread
+    /*
     let state = AppState {
         captured_data: Arc::new(Mutex::new(Vec::new())),
     };
@@ -101,7 +102,7 @@ async fn main() -> Result<(), String> {
     });
 
     println!("Web server started at http://127.0.0.1:8080");
-
+    */
     println!("Starting packet capture (press Ctrl+C to stop)...");
     loop {
         match capture_and_parse(&interface_name, 5000, Some("type mgt")) {
@@ -117,7 +118,7 @@ async fn main() -> Result<(), String> {
                         }
                     }
                 }
-                
+                /*
                 if let Ok(mut data) = state.captured_data.lock() {
                     for frame in &frames {
                         if let Some(ssid) = &frame.ssid {
@@ -126,7 +127,7 @@ async fn main() -> Result<(), String> {
                         }
                     }
                 }
-                
+                */
                 let access_points = get_access_points(&frames);
                 if !access_points.is_empty() {
                     println!("\n--- Detected Access Points ---");
