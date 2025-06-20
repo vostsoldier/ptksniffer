@@ -1,3 +1,4 @@
+use crate::parser::{ParsedFrame, FrameType, ManagementSubtype, DataSubtype};
 use std::collections::HashMap;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -8,7 +9,6 @@ use ccm::{
     consts::{U8, U13},
     Ccm,
 };
-use crate::parser::{ParsedFrame, FrameType, ManagementSubtype};
 
 type Aes128Ccm = Ccm<Aes128, U8, U13>;
 type HmacSha1 = Hmac<Sha1>;
@@ -61,7 +61,8 @@ impl Decryptor {
     pub fn process_packet(&mut self, frame: &ParsedFrame, ssid_map: &HashMap<String, String>) -> Option<Vec<u8>> {
         if let Some(payload) = &frame.payload {
             if self.is_eapol_frame(payload) {
-                if let (Some(bssid), Some(client_mac)) = (&frame.bssid, &frame.mac_src) {
+                if let (Some(bssid), Some(_)) = (&frame.bssid, &frame.mac_src) {
+                    let client_mac = &frame.mac_src;
                     if let Some(handshake_info) = self.extract_handshake_info(bssid, client_mac, payload) {
                         self.add_handshake(handshake_info);
                         
@@ -279,7 +280,7 @@ impl Decryptor {
             let mut data_with_counter = data.clone();
             data_with_counter.push(i as u8);
             
-            let mut hmac = HmacSha1::new_from_slice(key)
+            let mut hmac = <HmacSha1 as Mac>::new_from_slice(key)
                 .expect("HMAC initialization should not fail");
             hmac.update(&data_with_counter);
             let result = hmac.finalize().into_bytes();
@@ -348,7 +349,7 @@ impl Decryptor {
 
             let is_qos_data = match &frame.frame_type {
                 FrameType::Data(subtype) => {
-                    matches!(subtype, parser::DataSubtype::QoSData)
+                    matches!(subtype, DataSubtype::QosData)
                 },
                 _ => false,
             };
