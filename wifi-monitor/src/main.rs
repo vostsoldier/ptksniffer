@@ -91,12 +91,25 @@ async fn main() -> Result<(), String> {
         channel_hopping(&hopping_interface);
     });
 
-    println!("Running initial network discovery...");
-    let mac_to_ssid = match discover_networks(&interface_name) {
+    println!("Running network discovery...");
+    println!("Phase 1: Basic discovery");
+    let mut mac_to_ssid = match discover_networks(&interface_name) {
         Ok(mapping) => mapping,
         Err(e) => {
             eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
             HashMap::new()
+        }
+    };
+
+    println!("Phase 2: Aggressive hidden SSID discovery");
+    match aggressive_ssid_discovery(&interface_name) {
+        Ok(hidden_mapping) => {
+\            for (mac, ssid) in hidden_mapping {
+                mac_to_ssid.insert(mac, ssid);
+            }
+        },
+        Err(e) => {
+            eprintln!("Warning: Aggressive discovery failed: {}. Using basic results.", e);
         }
     };
 
@@ -149,9 +162,26 @@ async fn main() -> Result<(), String> {
                 for frame in &frames {
                     if let Some(payload) = &frame.payload {
                         if payload.len() > 0 {
-                            println!("DATA PACKET: {} -> {}", frame.mac_src, frame.mac_dst);
+\                            let ap_name = if let Some(bssid) = &frame.bssid {
+                                if mac_to_ssid.contains_key(bssid) {
+                                    format!("{} ({})", bssid, mac_to_ssid.get(bssid).unwrap())
+                                } else {
+                                    bssid.clone()
+                                }
+                            } else {
+                                "Unknown AP".to_string()
+                            };
+                            
+                            println!("\nDATA PACKET: {} → {} via {}", 
+                                    frame.mac_src, frame.mac_dst, ap_name);
                             println!("  Length: {} bytes", frame.frame_length);
                             println!("  Sequence: {}", frame.sequence_number.unwrap_or(0));
+                            
+                            println!("  Analysis:");
+                            let insights = analyze_data_packet(frame);
+                            for insight in insights {
+                                println!("    • {}", insight);
+                            }
                             
                             println!("  Payload (first 48 bytes):");
                             print_hex_dump(&payload[..std::cmp::min(48, payload.len())]);
@@ -264,6 +294,121 @@ fn extract_text_from_payload(data: &[u8]) {
     }
 }
 
+fn analyze_data_packet(frame: &parser::ParsedFrame) -> Vec<String> {
+    let mut insights = Vec::new();
+    
+    if let Some(payload) = &frame.payload {
+        if payload.len() < 8 {
+            return vec!["Packet too short for analysis".to_string()];
+        }
+        
+        if payload.len() >= 8 && payload[0] == 0xAA && payload[1] == 0xAA && payload[2] == 0x03 {
+            let protocol_type = ((payload[6] as u16) << 8) | (payload[7] as u16);
+            
+            match protocol_type {
+                0x0800 => {
+                    insights.push("IPv4 packet".to_string());
+                    if payload.len() >= 20 + 8 {
+                        let ip_header_len = (payload[8] & 0x0F) * 4;
+                        let src_ip = format!("{}.{}.{}.{}", 
+                                     payload[12+8], payload[13+8], payload[14+8], payload[15+8]);
+                        let dst_ip = format!("{}.{}.{}.{}", 
+                                     payload[16+8], payload[17+8], payload[18+8], payload[19+8]);
+                        insights.push(format!("Source IP: {}", src_ip));
+                        insights.push(format!("Destination IP: {}", dst_ip));
+                        
+                        if payload.len() >= 8 + ip_header_len + 4 {
+                            let protocol = payload[9+8];
+                            match protocol {
+                                6 => {
+                                    insights.push("TCP packet".to_string());
+                                    if payload.len() >= 8 + ip_header_len + 4 {
+                                        let offset = 8 + ip_header_len as usize;
+                                        let src_port = ((payload[offset] as u16) << 8) | (payload[offset+1] as u16);
+                                        let dst_port = ((payload[offset+2] as u16) << 8) | (payload[offset+3] as u16);
+                                        insights.push(format!("TCP Ports: {} → {}", src_port, dst_port));
+                                        
+                                        let service = match dst_port {
+                                            80 => "HTTP",
+                                            443 => "HTTPS",
+                                            22 => "SSH",
+                                            21 => "FTP",
+                                            25 => "SMTP",
+                                            110 => "POP3",
+                                            143 => "IMAP",
+                                            53 => "DNS",
+                                            _ => "Unknown"
+                                        };
+                                        if service != "Unknown" {
+                                            insights.push(format!("Service: {}", service));
+                                        }
+                                    }
+                                },
+                                17 => {
+                                    insights.push("UDP packet".to_string());
+                                    if payload.len() >= 8 + ip_header_len + 4 {
+                                        let offset = 8 + ip_header_len as usize;
+                                        let src_port = ((payload[offset] as u16) << 8) | (payload[offset+1] as u16);
+                                        let dst_port = ((payload[offset+2] as u16) << 8) | (payload[offset+3] as u16);
+                                        insights.push(format!("UDP Ports: {} → {}", src_port, dst_port));
+                                        
+                                        if src_port == 53 || dst_port == 53 {
+                                            insights.push("Service: DNS".to_string());
+                                        }
+                                    }
+                                },
+                                1 => {
+                                    insights.push("ICMP packet".to_string());
+                                },
+                                _ => {
+                                    insights.push(format!("IP Protocol: {}", protocol));
+                                }
+                            }
+                        }
+                    }
+                },
+                0x0806 => {
+                    insights.push("ARP packet".to_string());
+                    if payload.len() >= 28 + 8 {
+                        let operation = ((payload[6+8] as u16) << 8) | (payload[7+8] as u16);
+                        if operation == 1 {
+                            insights.push("ARP Request".to_string());
+                        } else if operation == 2 {
+                            insights.push("ARP Reply".to_string());
+                        }
+                    }
+                },
+                0x86DD => {
+                    insights.push("IPv6 packet".to_string());
+                    if payload.len() >= 40 + 8 {
+                        let src_ip = format!("{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:...",
+                                      payload[8+8], payload[9+8], payload[10+8], payload[11+8],
+                                      payload[12+8], payload[13+8], payload[14+8], payload[15+8]);
+                        insights.push(format!("Source IPv6: {}", src_ip));
+                    }
+                },
+                _ => {
+                    insights.push(format!("Unknown EtherType: 0x{:04x}", protocol_type));
+                }
+            }
+        } else if payload.len() >= 2 {
+            if payload[0] == 0x08 && payload[1] == 0x00 {
+                insights.push("Possible IPv4 packet (no LLC)".to_string());
+            } else if payload[0] == 0x86 && payload[1] == 0xDD {
+                insights.push("Possible IPv6 packet (no LLC)".to_string());
+            } else if payload[0] == 0x08 && payload[1] == 0x06 {
+                insights.push("Possible ARP packet (no LLC)".to_string());
+            }
+        }
+    }
+    
+    if insights.is_empty() {
+        insights.push("Encrypted or unknown data".to_string());
+    }
+    
+    insights
+}
+
 fn discover_networks(interface_name: &str) -> Result<HashMap<String, String>, String> {
     println!("Starting network discovery phase (15 seconds)...");
     
@@ -290,6 +435,92 @@ fn discover_networks(interface_name: &str) -> Result<HashMap<String, String>, St
     }
     
     println!("Discovery complete. Found {} networks with identifiable SSIDs", ap_count);
+    
+    Ok(mac_to_ssid)
+}
+
+fn aggressive_ssid_discovery(interface_name: &str) -> Result<HashMap<String, String>, String> {
+    println!("Starting aggressive SSID discovery (45 seconds)...");
+    println!("This will attempt to uncover hidden networks...");
+    
+    let frames = capture_and_parse(interface_name, 45000, None)?;
+    
+    let mut mac_to_ssid = HashMap::new();
+    let mut client_to_ap = HashMap::new();
+    let mut hidden_ap_count = 0;
+    
+    for frame in &frames {
+        if let (Some(bssid), Some(ssid)) = (&frame.bssid, &frame.ssid) {
+            if !mac_to_ssid.contains_key(bssid) {
+                if ssid != "<hidden>" {
+                    mac_to_ssid.insert(bssid.clone(), ssid.clone());
+                } else {
+                    hidden_ap_count += 1;
+                }
+            }
+        }
+        
+        if let FrameType::Data(_) = &frame.frame_type {
+            if let Some(bssid) = &frame.bssid {
+                let client = if &frame.mac_src != bssid {
+                    Some(frame.mac_src.clone())
+                } else if &frame.mac_dst != bssid {
+                    Some(frame.mac_dst.clone())
+                } else {
+                    None
+                };
+                
+                if let Some(client_mac) = client {
+                    client_to_ap.entry(client_mac)
+                        .or_insert_with(Vec::new)
+                        .push(bssid.clone());
+                }
+            }
+        }
+    }
+    
+    for frame in &frames {
+        match &frame.frame_type {
+            FrameType::Management(ManagementSubtype::ProbeRequest) => {
+                if let Some(ssid) = &frame.ssid {
+                    if ssid != "<hidden>" && !ssid.is_empty() {
+                        let client_mac = frame.mac_src.clone();
+                        
+                        if let Some(aps) = client_to_ap.get(&client_mac) {
+                            for ap_mac in aps {
+                                if !mac_to_ssid.contains_key(ap_mac) || mac_to_ssid.get(ap_mac).unwrap() == "<hidden>" {
+                                    mac_to_ssid.insert(ap_mac.clone(), format!("{}? (probable)", ssid));
+                                    println!("Potential hidden SSID match: {} -> {}", ap_mac, ssid);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            FrameType::Management(ManagementSubtype::ProbeResponse) => {
+                if let (Some(bssid), Some(ssid)) = (&frame.bssid, &frame.ssid) {
+                    if ssid != "<hidden>" {
+                        mac_to_ssid.insert(bssid.clone(), ssid.clone());
+                    }
+                }
+            },
+            FrameType::Management(ManagementSubtype::AssociationRequest) => {
+                if let (Some(bssid), Some(ssid)) = (&frame.bssid, &frame.ssid) {
+                    if ssid != "<hidden>" {
+                        mac_to_ssid.insert(bssid.clone(), ssid.clone());
+                        println!("Discovered hidden SSID from Association: {} -> {}", bssid, ssid);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    
+    println!("Aggressive discovery complete.");
+    println!("Found {} networks total, including {} with hidden SSIDs", 
+             mac_to_ssid.len() + hidden_ap_count, hidden_ap_count);
+    println!("Uncovered {} previously hidden networks", 
+             mac_to_ssid.values().filter(|s| s.contains("probable")).count());
     
     Ok(mac_to_ssid)
 }
