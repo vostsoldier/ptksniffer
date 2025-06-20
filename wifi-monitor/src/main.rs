@@ -118,6 +118,15 @@ async fn main() -> Result<(), String> {
                     }
                 }
                 
+                if let Ok(mut data) = state.captured_data.lock() {
+                    for frame in &frames {
+                        if let Some(ssid) = &frame.ssid {
+                            data.push(format!("MAC: {}, SSID: {}, RSSI: {}", 
+                                        frame.mac_src, ssid, frame.rssi.unwrap_or(0)));
+                        }
+                    }
+                }
+                
                 let access_points = get_access_points(&frames);
                 if !access_points.is_empty() {
                     println!("\n--- Detected Access Points ---");
