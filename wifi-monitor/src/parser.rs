@@ -271,11 +271,20 @@ fn extract_ssid(frame_data: &[u8]) -> Option<String> {
                 match String::from_utf8(ssid_bytes.to_vec()) {
                     Ok(ssid) => return Some(ssid),
                     Err(_) => {
-                        let hex_ssid = ssid_bytes.iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<String>>()
-                            .join(":");
-                        return Some(format!("HEX[{}]", hex_ssid));
+                        let readable_ssid: String = ssid_bytes.iter()
+                            .map(|&b| if b >= 32 && b <= 126 { b as char } else { '?' })
+                            .collect();
+                        
+                        let question_count = readable_ssid.chars().filter(|&c| c == '?').count();
+                        if question_count < readable_ssid.len() / 2 {
+                            return Some(format!("{} (non-UTF8)", readable_ssid));
+                        } else {
+                            let hex_ssid = ssid_bytes.iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<String>>()
+                                .join(":");
+                            return Some(format!("HEX[{}]", hex_ssid));
+                        }
                     }
                 }
             }

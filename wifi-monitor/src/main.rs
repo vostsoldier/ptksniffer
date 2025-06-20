@@ -14,6 +14,9 @@ mod web;
 use interface::WifiInterface;
 use parser::{capture_and_parse, get_access_points};
 use display::{display_results, log_to_file};
+use std::collections::HashMap;
+use parser::FrameType;
+use parser::ManagementSubtype;
 
 #[cfg(unix)]
 extern crate libc;
@@ -133,9 +136,15 @@ async fn main() -> Result<(), String> {
                     println!("\n--- Detected Access Points ---");
                     println!("{:<17} {:<32} {:<6} {:<8} {:<10}", "BSSID", "SSID", "RSSI", "Channel", "Security");
                     for ap in access_points.values() {
+                        let display_ssid = if ap.ssid == "<hidden>" && mac_to_ssid.contains_key(&ap.bssid) {
+                            format!("{} (uncovered)", mac_to_ssid.get(&ap.bssid).unwrap())
+                        } else {
+                            ap.ssid.clone()
+                        };
+                        
                         println!("{:<17} {:<32} {:<6} {:<8} {:<10}",
                                 ap.bssid,
-                                ap.ssid,
+                                display_ssid,
                                 ap.rssi.map_or("?".to_string(), |r| r.to_string()),
                                 ap.channel.map_or("?".to_string(), |c| c.to_string()),
                                 ap.security.as_ref().map_or("Unknown".to_string(), |s| format!("{:?}", s)));
@@ -224,4 +233,100 @@ fn print_hex_dump(data: &[u8]) {
         }
         println!();
     }
+    
+    println!("\n  Text extraction:");
+    extract_text_from_payload(data);
+}
+
+fn extract_text_from_payload(data: &[u8]) {
+    let mut text_buffer = Vec::new();
+    let mut in_text = false;
+    let mut text_pos = 0;
+    
+    for (i, &byte) in data.iter().enumerate() {
+        if byte >= 32 && byte <= 126 {
+            if !in_text {
+                in_text = true;
+                text_pos = i;
+            }
+            text_buffer.push(byte);
+        } else if in_text {
+            if text_buffer.len() >= 4 {  
+                let text = String::from_utf8_lossy(&text_buffer);
+                println!("    Position {}-{}: \"{}\"", text_pos, i-1, text);
+            }
+            text_buffer.clear();
+            in_text = false;
+        }
+    }
+    
+    if in_text && text_buffer.len() >= 4 {
+        let text = String::from_utf8_lossy(&text_buffer);
+        println!("    Position {}-{}: \"{}\"", text_pos, data.len()-1, text);
+    }
+    
+    if !in_text && text_buffer.is_empty() {
+        println!("    No readable text found in payload");
+    }
+}
+
+fn discover_networks(interface_name: &str) -> Result<HashMap<String, String>, String> {
+    println!("Starting network discovery phase (15 seconds)...");
+    
+    let frames = capture_and_parse(interface_name, 15000, None)?;
+    
+    let mut mac_to_ssid = HashMap::new();
+    let mut ap_count = 0;
+    
+    for frame in &frames {
+        if let (Some(bssid), Some(ssid)) = (&frame.bssid, &frame.ssid) {
+            if !mac_to_ssid.contains_key(bssid) && ssid != "<hidden>" {
+                mac_to_ssid.insert(bssid.clone(), ssid.clone());
+                ap_count += 1;
+            }
+        }
+        
+        if let FrameType::Data(_) = &frame.frame_type {
+            if let Some(bssid) = &frame.bssid {
+                if !mac_to_ssid.contains_key(bssid) {
+                    mac_to_ssid.insert(bssid.clone(), format!("Unknown AP ({})", bssid));
+                }
+            }
+        }
+    }
+    
+    println!("Discovery complete. Found {} networks with identifiable SSIDs", ap_count);
+    
+    Ok(mac_to_ssid)
+}
+
+
+println!("Running initial network discovery...");
+let mac_to_ssid = match discover_networks(&interface_name) {
+    Ok(mapping) => mapping,
+    Err(e) => {
+        eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
+        HashMap::new()
+    }
+};
+
+let access_points = get_access_points(&frames);
+if !access_points.is_empty() {
+    println!("\n--- Detected Access Points ---");
+    println!("{:<17} {:<32} {:<6} {:<8} {:<10}", "BSSID", "SSID", "RSSI", "Channel", "Security");
+    for ap in access_points.values() {
+        let display_ssid = if ap.ssid == "<hidden>" && mac_to_ssid.contains_key(&ap.bssid) {
+            format!("{} (uncovered)", mac_to_ssid.get(&ap.bssid).unwrap())
+        } else {
+            ap.ssid.clone()
+        };
+        
+        println!("{:<17} {:<32} {:<6} {:<8} {:<10}",
+                ap.bssid,
+                display_ssid,
+                ap.rssi.map_or("?".to_string(), |r| r.to_string()),
+                ap.channel.map_or("?".to_string(), |c| c.to_string()),
+                ap.security.as_ref().map_or("Unknown".to_string(), |s| format!("{:?}", s)));
+    }
+    println!();
 }
