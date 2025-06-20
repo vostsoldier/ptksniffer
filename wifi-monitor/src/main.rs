@@ -131,15 +131,30 @@ async fn main() -> Result<(), String> {
                 let access_points = get_access_points(&frames);
                 if !access_points.is_empty() {
                     println!("\n--- Detected Access Points ---");
-                    println!("{:<17} {:<32} {:<6} {:<8}", "BSSID", "SSID", "RSSI", "Channel");
+                    println!("{:<17} {:<32} {:<6} {:<8} {:<10}", "BSSID", "SSID", "RSSI", "Channel", "Security");
                     for ap in access_points.values() {
-                        println!("{:<17} {:<32} {:<6} {:<8}",
-                                 ap.bssid,
-                                 ap.ssid,
-                                 ap.rssi.map_or("?".to_string(), |r| r.to_string()),
-                                 ap.channel.map_or("?".to_string(), |c| c.to_string()));
+                        println!("{:<17} {:<32} {:<6} {:<8} {:<10}",
+                                ap.bssid,
+                                ap.ssid,
+                                ap.rssi.map_or("?".to_string(), |r| r.to_string()),
+                                ap.channel.map_or("?".to_string(), |c| c.to_string()),
+                                ap.security.as_ref().map_or("Unknown".to_string(), |s| format!("{:?}", s)));
                     }
                     println!();
+                }
+
+                for frame in &frames {
+                    if let Some(payload) = &frame.payload {
+                        if payload.len() > 0 {
+                            println!("DATA PACKET: {} -> {}", frame.mac_src, frame.mac_dst);
+                            println!("  Length: {} bytes", frame.frame_length);
+                            println!("  Sequence: {}", frame.sequence_number.unwrap_or(0));
+                            
+                            println!("  Payload (first 48 bytes):");
+                            print_hex_dump(&payload[..std::cmp::min(48, payload.len())]);
+                            println!();
+                        }
+                    }
                 }
             },
             Err(e) => {
@@ -185,5 +200,28 @@ fn channel_hopping(interface: &str) {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
+    }
+}
+
+fn print_hex_dump(data: &[u8]) {
+    for chunk in data.chunks(16) {
+        for byte in chunk {
+            print!("{:02x} ", byte);
+        }
+        
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        
+        print!(" | ");
+        
+        for &byte in chunk {
+            if byte >= 32 && byte <= 126 {
+                print!("{}", byte as char);
+            } else {
+                print!(".");
+            }
+        }
+        println!();
     }
 }

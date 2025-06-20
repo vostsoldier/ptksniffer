@@ -12,6 +12,11 @@ pub struct ParsedFrame {
     pub rssi: Option<i8>,
     pub channel: Option<u8>,
     pub timestamp: std::time::SystemTime,
+    pub sequence_number: Option<u16>,
+    pub frequency: Option<u16>,
+    pub payload: Option<Vec<u8>>,
+    pub frame_length: usize,
+    pub security: Option<SecurityType>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +81,16 @@ pub enum DataSubtype {
     QosCfPoll,
     QosCfAckCfPoll,
     Other(u8),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SecurityType {
+    Open,
+    WEP,
+    WPA,
+    WPA2,
+    WPA3,
+    Unknown,
 }
 
 /// Main parser function
@@ -180,6 +195,44 @@ pub fn parse_packet(packet: &Packet) -> Option<ParsedFrame> {
         _ => None,
     };
     
+    let sequence_number = if frame_data.len() >= 24 {
+        Some(((frame_data[22] as u16) >> 4) | ((frame_data[23] as u16) << 4))
+    } else {
+        None
+    };
+    
+    let frequency = if channel.is_some() {
+        let ch = channel.unwrap() as u16;
+        if ch <= 14 {
+            Some(2407 + ch * 5) 
+        } else {
+            Some(5000 + ch * 5) 
+        }
+    } else {
+        None
+    };
+    
+    let security = match &frame_type {
+        FrameType::Management(ManagementSubtype::Beacon) |
+        FrameType::Management(ManagementSubtype::ProbeResponse) => {
+            extract_security_info(frame_data)
+        },
+        _ => None,
+    };
+    
+    // Payload extraction
+    let payload = match &frame_type {
+        FrameType::Data(_) => {
+            let header_size = 24; // Basic size, adjust for QoS/HT frames
+            if frame_data.len() > header_size {
+                Some(frame_data[header_size..].to_vec())
+            } else {
+                None
+            }
+        },
+        _ => None,
+    };
+    
     Some(ParsedFrame {
         frame_type,
         mac_src,
@@ -189,6 +242,11 @@ pub fn parse_packet(packet: &Packet) -> Option<ParsedFrame> {
         rssi,
         channel,
         timestamp: std::time::SystemTime::now(),
+        sequence_number,
+        frequency,
+        payload,
+        frame_length: frame_data.len(),
+        security,
     })
 }
 
@@ -208,7 +266,18 @@ fn extract_ssid(frame_data: &[u8]) -> Option<String> {
             if tag_length == 0 {
                 return Some("<hidden>".to_string());
             } else if pos + 2 + tag_length <= frame_data.len() {
-                return Some(String::from_utf8_lossy(&frame_data[pos + 2..pos + 2 + tag_length]).to_string());
+                let ssid_bytes = &frame_data[pos + 2..pos + 2 + tag_length];
+                
+                match String::from_utf8(ssid_bytes.to_vec()) {
+                    Ok(ssid) => return Some(ssid),
+                    Err(_) => {
+                        let hex_ssid = ssid_bytes.iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<Vec<String>>()
+                            .join(":");
+                        return Some(format!("HEX[{}]", hex_ssid));
+                    }
+                }
             }
             return None;
         }
@@ -318,6 +387,17 @@ pub fn capture_and_parse(device_name: &str, timeout_ms: u32, filter: Option<&str
     Ok(frames)
 }
 
+#[derive(Debug, Clone)]
+pub struct AccessPoint {
+    pub bssid: String,
+    pub ssid: String,
+    pub rssi: Option<i8>,
+    pub channel: Option<u8>,
+    pub last_seen: std::time::SystemTime,
+    pub beacon_count: u32,
+    pub security: Option<SecurityType>,
+}
+
 pub fn get_access_points(frames: &[ParsedFrame]) -> HashMap<String, AccessPoint> {
     let mut aps = HashMap::new();
     
@@ -331,6 +411,7 @@ pub fn get_access_points(frames: &[ParsedFrame]) -> HashMap<String, AccessPoint>
                     channel: frame.channel,
                     last_seen: frame.timestamp,
                     beacon_count: 0,
+                    security: frame.security.clone(),
                 });
                 
                 ap.beacon_count += 1;
@@ -338,6 +419,9 @@ pub fn get_access_points(frames: &[ParsedFrame]) -> HashMap<String, AccessPoint>
                     ap.rssi = Some(rssi);
                 }
                 ap.last_seen = frame.timestamp;
+                if ap.security.is_none() {
+                    ap.security = frame.security.clone();
+                }
             }
         }
     }
@@ -345,12 +429,12 @@ pub fn get_access_points(frames: &[ParsedFrame]) -> HashMap<String, AccessPoint>
     aps
 }
 
-#[derive(Debug, Clone)]
-pub struct AccessPoint {
-    pub bssid: String,
-    pub ssid: String,
-    pub rssi: Option<i8>,
-    pub channel: Option<u8>,
-    pub last_seen: std::time::SystemTime,
-    pub beacon_count: u32,
+fn channel_to_frequency(channel: u8) -> u16 {
+    if channel >= 1 && channel <= 11 {
+        2407 + (channel as u16) * 5
+    } else if channel >= 36 && channel <= 165 {
+        5150 + ((channel - 36) as u16) * 5
+    } else {
+        0 
+    }
 }
