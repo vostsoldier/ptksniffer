@@ -106,6 +106,15 @@ async fn main() -> Result<(), String> {
     println!("Setting up decryption capabilities...");
     let mut decryptor = setup_decryption();
 
+    println!("Capturing initial frames to determine network parameters...");
+    let initial_frames = match capture_and_parse(&interface_name, 5000, None) {
+        Ok(frames) => frames,
+        Err(e) => {
+            eprintln!("Warning: Initial frame capture failed: {}. Will use channel hopping.", e);
+            Vec::new()
+        }
+    };
+
     let target_channel = if !decryptor.network_keys.is_empty() {
         let target_ssid = decryptor.network_keys.keys().next().unwrap();
         
@@ -113,7 +122,7 @@ async fn main() -> Result<(), String> {
         for (bssid, ssid) in &mac_to_ssid {
             if ssid.to_lowercase() == target_ssid.to_lowercase() {
                 // Find the channel from access points
-                for ap in get_access_points(&frames).values() {
+                for ap in get_access_points(&initial_frames).values() {
                     if &ap.bssid == bssid {
                         channel = ap.channel;
                         break;
@@ -1010,4 +1019,52 @@ fn inject_raw_frame(interface_name: &str, frame_data: &[u8]) -> Result<(), Strin
     println!("Successfully sent {} byte frame (with {} byte RadioTap header)", 
              complete_frame.len(), complete_frame.len() - frame_data.len());
     Ok(())
+}
+
+fn get_interface_mac(interface_name: &str) -> Result<String, String> {
+    let output = match std::process::Command::new("ip")
+        .arg("link")
+        .arg("show")
+        .arg(interface_name)
+        .output() {
+            Ok(output) => output,
+            Err(_) => {
+                return match std::process::Command::new("ifconfig")
+                    .arg(interface_name)
+                    .output() {
+                        Ok(output) => parse_ifconfig_output(&output.stdout, interface_name),
+                        Err(e) => Err(format!("Failed to get interface MAC: {}", e)),
+                    };
+            }
+        };
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    for line in output_str.lines() {
+        if line.contains("link/ether") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return Ok(parts[1].to_string());
+            }
+        }
+    }
+    
+    Err(format!("Could not determine MAC address for {}", interface_name))
+}
+
+fn parse_ifconfig_output(output: &[u8], interface_name: &str) -> Result<String, String> {
+    let output_str = String::from_utf8_lossy(output);
+    for line in output_str.lines() {
+        if line.contains("ether") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                for (i, part) in parts.iter().enumerate() {
+                    if *part == "ether" && i + 1 < parts.len() {
+                        return Ok(parts[i + 1].to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(format!("Could not find MAC address in ifconfig output for {}", interface_name))
 }
