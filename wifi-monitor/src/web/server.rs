@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer, Responder};
 use std::sync::Mutex;
 
+#[derive(Clone)] 
 struct AppState {
     captured_data: Mutex<Vec<String>>, // Store captured data
 }
