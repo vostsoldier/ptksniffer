@@ -424,6 +424,56 @@ pub fn get_access_points(frames: &[ParsedFrame]) -> HashMap<String, AccessPoint>
                 }
             }
         }
+        
+        else if let FrameType::Management(ManagementSubtype::ProbeResponse) = &frame.frame_type {
+            if let (Some(bssid), Some(ssid)) = (&frame.bssid, &frame.ssid) {
+                if !aps.contains_key(bssid) || aps.get(bssid).unwrap().ssid == "<hidden>" {
+                    let ap = aps.entry(bssid.clone()).or_insert_with(|| AccessPoint {
+                        bssid: bssid.clone(),
+                        ssid: ssid.clone(),
+                        rssi: frame.rssi,
+                        channel: frame.channel,
+                        last_seen: frame.timestamp,
+                        beacon_count: 0,
+                        security: frame.security.clone(),
+                    });
+                    
+                    if let Some(rssi) = frame.rssi {
+                        ap.rssi = Some(rssi);
+                    }
+                    ap.last_seen = frame.timestamp;
+                    if ap.ssid == "<hidden>" && ssid != "<hidden>" {
+                        ap.ssid = ssid.clone();
+                        println!("Discovered hidden SSID: {} for AP: {}", ssid, bssid);
+                    }
+                }
+            }
+        }
+        
+        else if let FrameType::Management(ManagementSubtype::AssociationRequest) = &frame.frame_type {
+            if let (Some(bssid), Some(ssid)) = (&frame.bssid, &frame.ssid) {
+                if !aps.contains_key(bssid) || aps.get(bssid).unwrap().ssid == "<hidden>" {
+                    println!("Discovered hidden SSID from Association: {} for AP: {}", ssid, bssid);
+                    let ap = aps.entry(bssid.clone()).or_insert_with(|| AccessPoint {
+                        bssid: bssid.clone(),
+                        ssid: ssid.clone(),
+                        rssi: frame.rssi,
+                        channel: frame.channel,
+                        last_seen: frame.timestamp,
+                        beacon_count: 0,
+                        security: frame.security.clone(),
+                    });
+                    
+                    if let Some(rssi) = frame.rssi {
+                        ap.rssi = Some(rssi);
+                    }
+                    ap.last_seen = frame.timestamp;
+                    if ap.security.is_none() {
+                        ap.security = frame.security.clone();
+                    }
+                }
+            }
+        }
     }
     
     aps

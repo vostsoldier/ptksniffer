@@ -105,7 +105,7 @@ async fn main() -> Result<(), String> {
     */
     println!("Starting packet capture (press Ctrl+C to stop)...");
     loop {
-        match capture_and_parse(&interface_name, 5000, Some("type mgt")) {
+        match capture_and_parse(&interface_name, 5000, None) { 
             Ok(frames) => {
                 println!("Captured {} frames", frames.len());
                 
