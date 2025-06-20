@@ -61,21 +61,33 @@ impl Decryptor {
     pub fn process_packet(&mut self, frame: &ParsedFrame, ssid_map: &HashMap<String, String>) -> Option<Vec<u8>> {
         if let Some(payload) = &frame.payload {
             if self.is_eapol_frame(payload) {
+                println!("🔄 Detected EAPOL handshake frame");
+                
                 if let Some(bssid) = &frame.bssid {
+                    if let Some(ssid) = ssid_map.get(bssid) {
+                        println!("  ↪ For network: {} ({})", ssid, bssid);
+                        if self.network_keys.contains_key(ssid) {
+                            println!("  ↪ We have the password for this network! Watching for complete handshake.");
+                        }
+                    }
+                    
                     let client_mac = &frame.mac_src;
                     if let Some(handshake_info) = self.extract_handshake_info(bssid, client_mac, payload) {
                         self.add_handshake(handshake_info);
                         
                         if self.can_derive_keys(bssid) {
+                            println!("🔑 Complete handshake captured for {}", bssid);
                             if let Some(ssid) = ssid_map.get(bssid) {
                                 if let Some(password) = self.network_keys.get(ssid) {
+                                    println!("🔐 Attempting key derivation for {} using password", ssid);
                                     match self.derive_keys(bssid, ssid, password) {
                                         Ok(keys) => {
-                                            println!("Successfully derived keys for network: {}", ssid);
+                                            println!("✅ Successfully derived keys for network: {}", ssid);
+                                            println!("  ↪ PTK first 16 bytes: {:02x?}", &keys.ptk[0..16]);
                                             self.decryption_keys.insert(bssid.clone(), keys);
                                         }
                                         Err(e) => {
-                                            println!("Failed to derive keys: {}", e);
+                                            println!("❌ Failed to derive keys: {}", e);
                                         }
                                     }
                                 }
@@ -83,7 +95,7 @@ impl Decryptor {
                         }
                     }
                 }
-                return None; 
+                return None;
             }
             
             if let FrameType::Data(_) = &frame.frame_type {
@@ -316,12 +328,17 @@ impl Decryptor {
                 return None;
             }
             
+            let is_protected = frame.frame_length > 24 && (frame.frame_length % 4 == 0);
+            if !is_protected {
+                return None; 
+            }
+            
             let pn = [
                 payload[7], payload[6], payload[5], payload[4], payload[1], payload[0]
             ];
             
-            let encrypted_data = &payload[8..payload.len()-8]; 
-            let mic = &payload[payload.len()-8..];
+            println!("🔓 Attempting to decrypt packet:");
+            println!("  ↪ Packet number (PN): {:02x?}", pn);
             
             // Construct the nonce (13 bytes)
             let mut nonce = [0u8; 13];
@@ -426,6 +443,7 @@ impl Decryptor {
             ) {
                 Ok(_) => {
                     println!("Successfully decrypted packet!");
+                    println!("  ↪ Decrypted length: {} bytes", decrypted.len());
                     Some(decrypted)
                 },
                 Err(e) => {

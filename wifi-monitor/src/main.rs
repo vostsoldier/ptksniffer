@@ -120,9 +120,15 @@ async fn main() -> Result<(), String> {
     println!("Setting up decryption capabilities...");
     let mut decryptor = setup_decryption();
 
+    if !decryptor.network_keys.is_empty() {
+        wait_for_handshakes(&interface_name, &mut decryptor, &mac_to_ssid)?;
+    }
+
+    let mut current_filter = build_capture_filter(&decryptor, &mac_to_ssid);
+
     println!("Starting packet capture (press Ctrl+C to stop)...");
     loop {
-        match capture_and_parse(&interface_name, 5000, None) { 
+        match capture_and_parse(&interface_name, 5000, current_filter.as_deref()) {
             Ok(frames) => {
                 println!("Captured {} frames", frames.len());
                 
@@ -262,6 +268,9 @@ async fn main() -> Result<(), String> {
                             }
                         }
                     }
+                }
+                if decryptor.network_keys.len() > 0 {
+                    current_filter = build_capture_filter(&decryptor, &mac_to_ssid);
                 }
             },
             Err(e) => {
@@ -634,4 +643,97 @@ fn setup_decryption() -> Decryptor {
     println!("Note: Full decryption requires capturing a complete WPA handshake.");
     
     decryptor
+}
+
+fn build_capture_filter(decryptor: &Decryptor, mac_to_ssid: &HashMap<String, String>) -> Option<String> {
+    let target_ssids: Vec<&String> = decryptor.network_keys.keys().collect();
+    
+    if target_ssids.is_empty() {
+        println!("No specific networks provided - capturing all networks");
+        return None;
+    }
+    
+    // Find BSSIDs (MAC addresses) for these SSIDs
+    let mut target_bssids = Vec::new();
+    for (bssid, ssid) in mac_to_ssid {
+        if target_ssids.iter().any(|&s| s == ssid) {
+            target_bssids.push(bssid.clone());
+        }
+    }
+    
+    if target_bssids.is_empty() {
+        println!("Couldn't find target networks yet - capturing all networks to discover them");
+        return None;
+    }
+    
+    let mut filter = String::new();
+    
+    for (i, bssid) in target_bssids.iter().enumerate() {
+        if i > 0 {
+            filter.push_str(" or ");
+        }
+        filter.push_str(&format!("(wlan addr1 {} or wlan addr2 {} or wlan addr3 {})", 
+                             bssid, bssid, bssid));
+    }
+    
+    println!("Filtering capture to only include packets from your networks:");
+    for bssid in &target_bssids {
+        if let Some(ssid) = mac_to_ssid.get(bssid) {
+            println!("  • {} ({})", ssid, bssid);
+        }
+    }
+    
+    Some(filter)
+}
+
+
+fn wait_for_handshakes(interface_name: &str, decryptor: &mut Decryptor, mac_to_ssid: &HashMap<String, String>) -> Result<(), String> {
+    println!("\n--- Waiting for Network Handshakes ---");
+    println!("Attempting to capture authentication handshakes for your networks.");
+    println!("This may take some time until devices connect to the network.");
+    println!("Capturing for up to 60 seconds...");
+    
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(60);
+    
+    while start_time.elapsed() < timeout {
+        print!(".");
+        io::stdout().flush().unwrap();
+        
+        match capture_and_parse(interface_name, 5000, None) {
+            Ok(frames) => {
+                for frame in &frames {
+                    decryptor.process_packet(frame, mac_to_ssid);
+                }
+                
+                let mut have_all_keys = true;
+                for ssid in decryptor.network_keys.keys() {
+                    let found = mac_to_ssid.iter().any(|(bssid, net_ssid)| {
+                        net_ssid == ssid && decryptor.decryption_keys.contains_key(bssid)
+                    });
+                    
+                    if !found {
+                        have_all_keys = false;
+                        break;
+                    }
+                }
+                
+                if have_all_keys && !decryptor.network_keys.is_empty() {
+                    println!("\nSuccessfully captured handshakes for all networks!");
+                    return Ok(());
+                }
+            },
+            Err(_) => {
+            }
+        }
+    }
+    
+    println!("\nFinished waiting for handshakes.");
+    if decryptor.decryption_keys.is_empty() {
+        println!("No handshakes captured. Decryption will begin when handshakes are seen.");
+    } else {
+        println!("Captured handshakes for some networks. Monitoring will continue.");
+    }
+    
+    Ok(())
 }
