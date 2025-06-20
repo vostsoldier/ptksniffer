@@ -91,21 +91,15 @@ async fn main() -> Result<(), String> {
         channel_hopping(&hopping_interface);
     });
 
-    // Initialize and start the web server in a separate thread
-    /*
-    let state = AppState {
-        captured_data: Arc::new(Mutex::new(Vec::new())),
+    println!("Running initial network discovery...");
+    let mac_to_ssid = match discover_networks(&interface_name) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
+            HashMap::new()
+        }
     };
 
-    let web_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = start_server(web_state).await {
-            eprintln!("Web server error: {}", e);
-        }
-    });
-
-    println!("Web server started at http://127.0.0.1:8080");
-    */
     println!("Starting packet capture (press Ctrl+C to stop)...");
     loop {
         match capture_and_parse(&interface_name, 5000, None) { 
@@ -298,35 +292,4 @@ fn discover_networks(interface_name: &str) -> Result<HashMap<String, String>, St
     println!("Discovery complete. Found {} networks with identifiable SSIDs", ap_count);
     
     Ok(mac_to_ssid)
-}
-
-
-println!("Running initial network discovery...");
-let mac_to_ssid = match discover_networks(&interface_name) {
-    Ok(mapping) => mapping,
-    Err(e) => {
-        eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
-        HashMap::new()
-    }
-};
-
-let access_points = get_access_points(&frames);
-if !access_points.is_empty() {
-    println!("\n--- Detected Access Points ---");
-    println!("{:<17} {:<32} {:<6} {:<8} {:<10}", "BSSID", "SSID", "RSSI", "Channel", "Security");
-    for ap in access_points.values() {
-        let display_ssid = if ap.ssid == "<hidden>" && mac_to_ssid.contains_key(&ap.bssid) {
-            format!("{} (uncovered)", mac_to_ssid.get(&ap.bssid).unwrap())
-        } else {
-            ap.ssid.clone()
-        };
-        
-        println!("{:<17} {:<32} {:<6} {:<8} {:<10}",
-                ap.bssid,
-                display_ssid,
-                ap.rssi.map_or("?".to_string(), |r| r.to_string()),
-                ap.channel.map_or("?".to_string(), |c| c.to_string()),
-                ap.security.as_ref().map_or("Unknown".to_string(), |s| format!("{:?}", s)));
-    }
-    println!();
 }
