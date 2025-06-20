@@ -32,7 +32,8 @@ fn check_root_privileges() -> bool {
     }
 }
 
-fn main() -> Result<(), String> {
+#[tokio::main]
+async fn main() -> Result<(), String> {
     println!("Starting Wi-Fi Monitor...");
 
     if !check_root_privileges() {
