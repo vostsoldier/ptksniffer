@@ -290,7 +290,7 @@ pub fn capture_and_parse(device_name: &str, timeout_ms: u32, filter: Option<&str
         .map_err(|e| format!("Failed to open device: {}", e))?
         .promisc(true)
         .snaplen(2048)
-        .timeout(timeout_ms)
+        .timeout(std::time::Duration::from_millis(timeout_ms as u64))
         .open()
         .map_err(|e| format!("Failed to open capture: {}", e))?;
     

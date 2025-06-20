@@ -11,14 +11,13 @@ async fn index(data: web::Data<AppState>) -> impl Responder {
     format!("Captured Data:<br>{}", response)
 }
 
-pub async fn start_server(state: AppState) {
+pub async fn start_server(state: AppState) -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
-            .data(state.clone())
+            .app_data(web::Data::new(state.clone()))
             .route("/", web::get().to(index))
     })
-    .bind("127.0.0.1:8080")
-    .expect("Failed to bind server")
+    .bind("127.0.0.1:8080")?
     .run()
     .await
 }
