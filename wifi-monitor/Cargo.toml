@@ -20,6 +20,7 @@ sha1 = "0.10.5"
 pbkdf2 = "0.12.1"
 aes = "0.8.2"
 ccm = "0.5.0"
+lazy_static = "1.4.0"
 
 [build-dependencies]
 bindgen = "0.59" 

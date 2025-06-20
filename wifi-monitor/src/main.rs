@@ -20,6 +20,10 @@ use parser::FrameType;
 use parser::ManagementSubtype;
 use decryption::Decryptor;
 use std::io::{self, Write};
+use std::sync::Mutex;
+lazy_static::lazy_static! {
+    static ref MANUAL_BSSIDS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+}
 
 #[cfg(unix)]
 extern crate libc;
@@ -89,10 +93,41 @@ async fn main() -> Result<(), String> {
         process::exit(0);
     }).expect("Error setting Ctrl+C handler");
 
-    let hopping_interface = interface_name.clone();
-    std::thread::spawn(move || {
-        channel_hopping(&hopping_interface);
-    });
+    let target_channel = if !decryptor.network_keys.is_empty() {
+        let target_ssid = decryptor.network_keys.keys().next().unwrap();
+        
+        let mut channel = None;
+        for (bssid, ssid) in &mac_to_ssid {
+            if ssid.to_lowercase() == target_ssid.to_lowercase() {
+                for ap in get_access_points(&frames).values() {
+                    if &ap.bssid == bssid {
+                        channel = ap.channel;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if let Some(ch) = channel {
+            println!("Found target network on channel {}", ch);
+            match lock_to_channel(&interface_name, ch) {
+                Ok(_) => println!("Successfully locked to channel {}", ch),
+                Err(e) => eprintln!("Warning: Could not lock to channel: {}", e),
+            }
+            Some(ch)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if target_channel.is_none() {
+        let hopping_interface = interface_name.clone();
+        std::thread::spawn(move || {
+            channel_hopping(&hopping_interface);
+        });
+    }
 
     println!("Running network discovery...");
     println!("Phase 1: Basic discovery");
@@ -317,6 +352,18 @@ fn channel_hopping(interface: &str) {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
+}
+
+
+fn lock_to_channel(interface_name: &str, channel: u8) -> Result<(), String> {
+    println!("Locking to channel {} for continuous monitoring", channel);
+    
+    let wifi = WifiInterface::new(interface_name);
+    if let Err(e) = wifi.set_channel(channel) {
+        return Err(format!("Failed to set channel: {}", e));
+    }
+    
+    Ok(())
 }
 
 fn print_hex_dump(data: &[u8]) {
@@ -614,7 +661,6 @@ fn setup_decryption() -> Decryptor {
     
     println!("\n--- WiFi Decryption Setup ---");
     println!("To decrypt traffic, you need to provide the SSID and password for networks you own.");
-    println!("Note: You can only decrypt traffic for networks where you know the password.");
     
     loop {
         print!("\nEnter network SSID (or leave empty to finish): ");
@@ -633,15 +679,23 @@ fn setup_decryption() -> Decryptor {
         io::stdin().read_line(&mut password).expect("Failed to read input");
         let password = password.trim();
         
+        print!("Enter network BSSID (MAC address) if known (or leave empty): ");
+        io::stdout().flush().unwrap();
+        let mut bssid = String::new();
+        io::stdin().read_line(&mut bssid).expect("Failed to read input");
+        let bssid = bssid.trim();
+        
         if !password.is_empty() {
             decryptor.add_network(ssid, password);
+            
+            if !bssid.is_empty() {
+                MANUAL_BSSIDS.lock().unwrap().insert(bssid.to_string(), ssid.to_string());
+                println!("Added manual BSSID mapping: {} -> {}", bssid, ssid);
+            }
         }
     }
     
     println!("Decryption setup complete.");
-    println!("Looking for 4-way handshakes to enable decryption...");
-    println!("Note: Full decryption requires capturing a complete WPA handshake.");
-    
     decryptor
 }
 
@@ -704,10 +758,10 @@ fn build_capture_filter(decryptor: &Decryptor, mac_to_ssid: &HashMap<String, Str
     Some(filter)
 }
 
-fn get_connected_bssid() -> Option<String> {
+fn get_connected_bssid(interface_name: &str) -> Option<String> {
     let output = match std::process::Command::new("iw")
         .arg("dev")
-        .arg("wlan1") 
+        .arg(interface_name) 
         .arg("link")
         .output() {
             Ok(o) => o,
