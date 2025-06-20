@@ -493,9 +493,9 @@ fn analyze_data_packet(frame: &parser::ParsedFrame) -> Vec<String> {
 }
 
 fn discover_networks(interface_name: &str) -> Result<HashMap<String, String>, String> {
-    println!("Starting network discovery phase (15 seconds)...");
+    println!("Starting network discovery phase (30 seconds)...");
     
-    let frames = capture_and_parse(interface_name, 15000, None)?;
+    let frames = capture_and_parse(interface_name, 30000, None)?;
     
     let mut mac_to_ssid = HashMap::new();
     let mut ap_count = 0;
@@ -653,17 +653,31 @@ fn build_capture_filter(decryptor: &Decryptor, mac_to_ssid: &HashMap<String, Str
         return None;
     }
     
+    println!("\nDiscovered networks:");
+    for (bssid, ssid) in mac_to_ssid {
+        println!("  • {} ({})", ssid, bssid);
+    }
+    
     // Find BSSIDs (MAC addresses) for these SSIDs
     let mut target_bssids = Vec::new();
     for (bssid, ssid) in mac_to_ssid {
-        if target_ssids.iter().any(|&s| s == ssid) {
+        if target_ssids.iter().any(|&s| s.to_lowercase() == ssid.to_lowercase()) {
             target_bssids.push(bssid.clone());
         }
     }
     
     if target_bssids.is_empty() {
-        println!("Couldn't find target networks yet - capturing all networks to discover them");
-        return None;
+        println!("\nCouldn't find target networks in discovery scan.");
+        println!("Attempting to get BSSID of currently connected network...");
+        
+        if let Some(connected_bssid) = get_connected_bssid() {
+            println!("Found connected network BSSID: {}", connected_bssid);
+            target_bssids.push(connected_bssid);
+        } else {
+            println!("Couldn't determine connected network BSSID.");
+            println!("Capturing all traffic to discover target network.");
+            return None;
+        }
     }
     
     let mut filter = String::new();
@@ -676,16 +690,42 @@ fn build_capture_filter(decryptor: &Decryptor, mac_to_ssid: &HashMap<String, Str
                              bssid, bssid, bssid));
     }
     
-    println!("Filtering capture to only include packets from your networks:");
+    println!("\nFiltering capture to only include packets from your networks:");
     for bssid in &target_bssids {
         if let Some(ssid) = mac_to_ssid.get(bssid) {
             println!("  • {} ({})", ssid, bssid);
+        } else {
+            println!("  • Unknown BSSID: {} (looking for: {})", 
+                     bssid, 
+                     target_ssids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
         }
     }
     
     Some(filter)
 }
 
+fn get_connected_bssid() -> Option<String> {
+    let output = match std::process::Command::new("iw")
+        .arg("dev")
+        .arg("wlan1") 
+        .arg("link")
+        .output() {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+    
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    for line in output_str.lines() {
+        if line.contains("Connected to") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                return Some(parts[2].to_string());
+            }
+        }
+    }
+    
+    None
+}
 
 fn wait_for_handshakes(interface_name: &str, decryptor: &mut Decryptor, mac_to_ssid: &HashMap<String, String>) -> Result<(), String> {
     println!("\n--- Waiting for Network Handshakes ---");
