@@ -438,3 +438,46 @@ fn channel_to_frequency(channel: u8) -> u16 {
         0 
     }
 }
+
+fn extract_security_info(frame_data: &[u8]) -> Option<SecurityType> {
+    if frame_data.len() < 36 {
+        return None;
+    }
+    
+    let mut pos = 24;
+    let mut has_rsn = false;
+    
+    while pos + 2 < frame_data.len() {
+        let tag_number = frame_data[pos];
+        let tag_length = frame_data[pos + 1] as usize;
+        
+        if tag_number == 48 { 
+            has_rsn = true;
+            return Some(SecurityType::WPA2);
+        } else if tag_number == 221 && tag_length >= 8 {  
+            if pos + 6 < frame_data.len() && frame_data[pos+2] == 0x00 && 
+               frame_data[pos+3] == 0x50 && frame_data[pos+4] == 0xF2 && 
+               frame_data[pos+5] == 0x01 {
+                return Some(SecurityType::WPA);
+            }
+        }
+        
+        pos += 2 + tag_length;
+        if pos >= frame_data.len() {
+            break;
+        }
+    }
+    
+    if frame_data.len() > 34 {
+        let capability = (frame_data[34] as u16) | ((frame_data[35] as u16) << 8);
+        if (capability & 0x0010) != 0 {  
+            if !has_rsn {
+                return Some(SecurityType::WEP);
+            }
+        } else {
+            return Some(SecurityType::Open);
+        }
+    }
+    
+    Some(SecurityType::Unknown)
+}
