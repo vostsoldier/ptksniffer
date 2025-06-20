@@ -20,9 +20,9 @@ use parser::FrameType;
 use parser::ManagementSubtype;
 use decryption::Decryptor;
 use std::io::{self, Write};
-use std::sync::Mutex;
 lazy_static::lazy_static! {
     static ref MANUAL_BSSIDS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    static ref MANUAL_CHANNEL: Mutex<Option<u8>> = Mutex::new(None);
 }
 
 #[cfg(unix)]
@@ -93,12 +93,26 @@ async fn main() -> Result<(), String> {
         process::exit(0);
     }).expect("Error setting Ctrl+C handler");
 
+    println!("Running network discovery...");
+    println!("Phase 1: Basic discovery");
+    let mut mac_to_ssid = match discover_networks(&interface_name) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
+            HashMap::new()
+        }
+    };
+
+    println!("Setting up decryption capabilities...");
+    let mut decryptor = setup_decryption();
+
     let target_channel = if !decryptor.network_keys.is_empty() {
         let target_ssid = decryptor.network_keys.keys().next().unwrap();
         
         let mut channel = None;
         for (bssid, ssid) in &mac_to_ssid {
             if ssid.to_lowercase() == target_ssid.to_lowercase() {
+                // Find the channel from access points
                 for ap in get_access_points(&frames).values() {
                     if &ap.bssid == bssid {
                         channel = ap.channel;
@@ -128,48 +142,6 @@ async fn main() -> Result<(), String> {
             channel_hopping(&hopping_interface);
         });
     }
-
-    println!("Running network discovery...");
-    println!("Phase 1: Basic discovery");
-    let mut mac_to_ssid = match discover_networks(&interface_name) {
-        Ok(mapping) => mapping,
-        Err(e) => {
-            eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
-            HashMap::new()
-        }
-    };
-
-    if mac_to_ssid.is_empty() || std::env::args().any(|arg| arg == "--aggressive") {
-        println!("\nNetwork not found with basic discovery.");
-        println!("Switching to aggressive discovery techniques...");
-        
-        match aggressive_network_discovery(&interface_name) {
-            Ok(aggressive_mapping) => {
-                for (mac, ssid) in aggressive_mapping {
-                    mac_to_ssid.insert(mac, ssid);
-                }
-            },
-            Err(e) => {
-                eprintln!("Warning: Aggressive discovery failed: {}. Using basic results.", e);
-            }
-        };
-    } else {
-        println!("Phase 2: Hidden SSID discovery");
-        match aggressive_ssid_discovery(&interface_name) {
-            Ok(hidden_mapping) => {
-                for (mac, ssid) in hidden_mapping {
-                    mac_to_ssid.insert(mac, ssid);
-                }
-            },
-            Err(e) => {
-                eprintln!("Warning: Hidden SSID discovery failed: {}. Using basic results.", e);
-            }
-        };
-    }
-
-    // Set up decryption
-    println!("Setting up decryption capabilities...");
-    let mut decryptor = setup_decryption();
 
     if !decryptor.network_keys.is_empty() {
         wait_for_handshakes(&interface_name, &mut decryptor, &mac_to_ssid)?;
@@ -764,7 +736,7 @@ fn build_capture_filter(decryptor: &Decryptor, mac_to_ssid: &HashMap<String, Str
         println!("\nCouldn't find target networks in discovery scan.");
         println!("Attempting to get BSSID of currently connected network...");
         
-        if let Some(connected_bssid) = get_connected_bssid() {
+        if let Some(connected_bssid) = get_connected_bssid("wlan1") {
             println!("Found connected network BSSID: {}", connected_bssid);
             target_bssids.push(connected_bssid);
         } else {
@@ -1032,7 +1004,7 @@ fn inject_raw_frame(interface_name: &str, frame_data: &[u8]) -> Result<(), Strin
         .open()
         .map_err(|e| format!("Failed to open capture: {}", e))?;
     
-    cap.sendpacket(&complete_frame)
+    cap.sendpacket(&*complete_frame)
         .map_err(|e| format!("Failed to send packet: {}", e))?;
     
     println!("Successfully sent {} byte frame (with {} byte RadioTap header)", 
