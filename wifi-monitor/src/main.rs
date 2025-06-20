@@ -2,6 +2,8 @@ use std::env;
 use std::process;
 use std::time::Duration;
 use pcap::Device;
+use std::sync::{Arc, Mutex};
+use web::server::{AppState, start_server};
 
 mod interface;
 mod parser;
@@ -84,6 +86,20 @@ fn main() -> Result<(), String> {
     std::thread::spawn(move || {
         channel_hopping(&hopping_interface);
     });
+
+    // Initialize and start the web server in a separate thread
+    let state = AppState {
+        captured_data: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let web_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_server(web_state).await {
+            eprintln!("Web server error: {}", e);
+        }
+    });
+
+    println!("Web server started at http://127.0.0.1:8080");
 
     println!("Starting packet capture (press Ctrl+C to stop)...");
     loop {

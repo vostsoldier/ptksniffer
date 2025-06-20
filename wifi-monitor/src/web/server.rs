@@ -1,9 +1,9 @@
 use actix_web::{web, App, HttpServer, Responder};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex}; 
 
-#[derive(Clone)] 
-struct AppState {
-    captured_data: Mutex<Vec<String>>, // Store captured data
+#[derive(Clone)]
+pub struct AppState {
+    pub captured_data: Arc<Mutex<Vec<String>>>, 
 }
 
 async fn index(data: web::Data<AppState>) -> impl Responder {
