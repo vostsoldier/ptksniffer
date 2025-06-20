@@ -1,1 +1,3 @@
-// This file is intentionally left blank.
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+}
