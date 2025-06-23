@@ -1,9 +1,12 @@
 use std::env;
 use std::process;
 use std::time::Duration;
-use pcap::Device;
+use pcap::{Device, Capture};
 use std::sync::{Arc, Mutex};
-use web::server::{AppState, start_server};
+use std::fs::File;
+use std::path::Path;
+use std::io::{self, Write, BufWriter};
+use chrono::Local;
 
 mod interface;
 mod parser;
@@ -13,38 +16,15 @@ mod web;
 mod decryption;
 
 use interface::WifiInterface;
-use parser::{capture_and_parse, get_access_points};
+use parser::{capture_and_parse, get_access_points, ParsedFrame};
 use display::{display_results, log_to_file};
 use std::collections::HashMap;
-use parser::FrameType;
-use parser::ManagementSubtype;
+use parser::{FrameType, ManagementSubtype, DataSubtype};
 use decryption::Decryptor;
-use std::io::{self, Write};
-lazy_static::lazy_static! {
-    static ref MANUAL_BSSIDS: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
-    static ref MANUAL_CHANNEL: Mutex<Option<u8>> = Mutex::new(None);
-}
-
-#[cfg(unix)]
-extern crate libc;
-
-fn check_root_privileges() -> bool {
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::geteuid() == 0
-        }
-    }
-    
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    println!("Starting Wi-Fi Monitor...");
+    println!("Starting WiFi Packet Capture Tool (Wireshark-like)...");
 
     if !check_root_privileges() {
         eprintln!("Error: This application requires root privileges.");
@@ -53,21 +33,86 @@ async fn main() -> Result<(), String> {
     }
     
     let args: Vec<String> = env::args().collect();
-    let interface_name = if args.len() > 1 {
-        args[1].clone()
-    } else {
+    let mut interface_name = String::new();
+    let mut output_file = None;
+    let mut display_filter = None;
+    let mut capture_filter = None;
+    let mut max_packets = 0; 
+    
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" | "--interface" => {
+                if i + 1 < args.len() {
+                    interface_name = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    eprintln!("Error: Interface name required after -i");
+                    process::exit(1);
+                }
+            },
+            "-w" | "--write" => {
+                if i + 1 < args.len() {
+                    output_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: Output file required after -w");
+                    process::exit(1);
+                }
+            },
+            "-f" | "--filter" => {
+                if i + 1 < args.len() {
+                    capture_filter = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: Filter expression required after -f");
+                    process::exit(1);
+                }
+            },
+            "-d" | "--display-filter" => {
+                if i + 1 < args.len() {
+                    display_filter = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: Display filter required after -d");
+                    process::exit(1);
+                }
+            },
+            "-c" | "--count" => {
+                if i + 1 < args.len() {
+                    max_packets = args[i + 1].parse().unwrap_or(0);
+                    i += 2;
+                } else {
+                    eprintln!("Error: Packet count required after -c");
+                    process::exit(1);
+                }
+            },
+            "-h" | "--help" => {
+                print_usage(&args[0]);
+                process::exit(0);
+            },
+            _ => {
+                if interface_name.is_empty() {
+                    interface_name = args[i].clone();
+                }
+                i += 1;
+            }
+        }
+    }
+    
+    if interface_name.is_empty() {
         match find_wifi_interface() {
             Some(interface) => {
                 println!("Auto-detected Wi-Fi interface: {}", interface);
-                interface
+                interface_name = interface;
             },
             None => {
                 eprintln!("Error: No Wi-Fi interface found. Please specify one.");
-                eprintln!("Usage: {} <interface>", args[0]);
+                print_usage(&args[0]);
                 process::exit(1);
             }
         }
-    };
+    }
 
     let interface = WifiInterface::new(&interface_name);
     println!("Using interface: {}", interface.get_interface_name());
@@ -78,6 +123,18 @@ async fn main() -> Result<(), String> {
         return Err(e);
     }
     println!("Interface is now in monitor mode");
+
+    let hopping_interface = interface_name.clone();
+    let _channel_hopper = std::thread::spawn(move || {
+        channel_hopping(&hopping_interface);
+    });
+
+    let mut pcap_writer = if let Some(file_path) = &output_file {
+        println!("Saving capture to file: {}", file_path);
+        Some(create_pcap_file(file_path)?)
+    } else {
+        None
+    };
 
     let interface_clone = interface_name.clone();
     ctrlc::set_handler(move || {
@@ -90,219 +147,48 @@ async fn main() -> Result<(), String> {
             println!("Interface restored to managed mode");
         }
         
+        if let Some(file_path) = &output_file {
+            println!("Capture saved to: {}", file_path);
+        }
+        
         process::exit(0);
     }).expect("Error setting Ctrl+C handler");
 
-    println!("Running network discovery...");
-    println!("Phase 1: Basic discovery");
-    let mut mac_to_ssid = match discover_networks(&interface_name) {
-        Ok(mapping) => mapping,
-        Err(e) => {
-            eprintln!("Warning: Network discovery failed: {}. Continuing without it.", e);
-            HashMap::new()
-        }
-    };
-
-    println!("Setting up decryption capabilities...");
-    let mut decryptor = setup_decryption();
-
-    println!("Capturing initial frames to determine network parameters...");
-    let initial_frames = match capture_and_parse(&interface_name, 5000, None) {
-        Ok(frames) => frames,
-        Err(e) => {
-            eprintln!("Warning: Initial frame capture failed: {}. Will use channel hopping.", e);
-            Vec::new()
-        }
-    };
-
-    let target_channel = if !decryptor.network_keys.is_empty() {
-        let target_ssid = decryptor.network_keys.keys().next().unwrap();
-        
-        let mut channel = None;
-        for (bssid, ssid) in &mac_to_ssid {
-            if ssid.to_lowercase() == target_ssid.to_lowercase() {
-                // Find the channel from access points
-                for ap in get_access_points(&initial_frames).values() {
-                    if &ap.bssid == bssid {
-                        channel = ap.channel;
-                        break;
-                    }
-                }
-            }
-        }
-        
-        if let Some(ch) = channel {
-            println!("Found target network on channel {}", ch);
-            match lock_to_channel(&interface_name, ch) {
-                Ok(_) => println!("Successfully locked to channel {}", ch),
-                Err(e) => eprintln!("Warning: Could not lock to channel: {}", e),
-            }
-            Some(ch)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    if target_channel.is_none() {
-        let hopping_interface = interface_name.clone();
-        std::thread::spawn(move || {
-            channel_hopping(&hopping_interface);
-        });
-    }
-
-    if !decryptor.network_keys.is_empty() {
-        wait_for_handshakes(&interface_name, &mut decryptor, &mac_to_ssid)?;
-    }
-
-    let mut current_filter = build_capture_filter(&decryptor, &mac_to_ssid);
-
     println!("Starting packet capture (press Ctrl+C to stop)...");
+    println!("{:<4} {:<19} {:<19} {:<19} {:<8} {:<10} {:<30}", 
+             "No.", "Time", "Source", "Destination", "Length", "Protocol", "Info");
+    println!("{:-<100}", "");
+
+    let mut packet_count = 0;
     loop {
-        match capture_and_parse(&interface_name, 5000, current_filter.as_deref()) {
+        match capture_and_parse(&interface_name, 1000, capture_filter.as_deref()) {
             Ok(frames) => {
-                println!("Captured {} frames", frames.len());
-                
                 for frame in &frames {
-                    if let Some(ssid) = &frame.ssid {
-                        display_results(&frame.mac_src, ssid, frame.rssi.unwrap_or(0) as i32);
-                        
-                        if let Err(e) = log_to_file(&frame.mac_src, ssid, frame.rssi.unwrap_or(0) as i32) {
-                            eprintln!("Error logging to file: {}", e);
+                    if let Some(ref filter) = display_filter {
+                        if !matches_display_filter(frame, filter) {
+                            continue;
                         }
                     }
-                }
-                /*
-                if let Ok(mut data) = state.captured_data.lock() {
-                    for frame in &frames {
-                        if let Some(ssid) = &frame.ssid {
-                            data.push(format!("MAC: {}, SSID: {}, RSSI: {}", 
-                                        frame.mac_src, ssid, frame.rssi.unwrap_or(0)));
+                    
+                    if let Some(ref mut writer) = pcap_writer {
+                        if let Some(ref raw_data) = frame.raw_data {
+                            write_packet_to_pcap(writer, raw_data)?;
                         }
                     }
-                }
-                */
-                let access_points = get_access_points(&frames);
-                if !access_points.is_empty() {
-                    println!("\n--- Detected Access Points ---");
-                    println!("{:<17} {:<32} {:<6} {:<8} {:<10}", "BSSID", "SSID", "RSSI", "Channel", "Security");
-                    for ap in access_points.values() {
-                        let display_ssid = if ap.ssid == "<hidden>" && mac_to_ssid.contains_key(&ap.bssid) {
-                            format!("{} (uncovered)", mac_to_ssid.get(&ap.bssid).unwrap())
+                    
+                    display_wireshark_style(packet_count + 1, frame);
+                    packet_count += 1;
+                    
+                    if max_packets > 0 && packet_count >= max_packets {
+                        println!("\nCaptured {} packets. Stopping.", max_packets);
+                        let cleanup_interface = WifiInterface::new(&interface_name);
+                        if let Err(e) = cleanup_interface.set_managed_mode() {
+                            eprintln!("Warning: Failed to restore managed mode: {}", e);
                         } else {
-                            ap.ssid.clone()
-                        };
-                        
-                        println!("{:<17} {:<32} {:<6} {:<8} {:<10}",
-                                ap.bssid,
-                                display_ssid,
-                                ap.rssi.map_or("?".to_string(), |r| r.to_string()),
-                                ap.channel.map_or("?".to_string(), |c| c.to_string()),
-                                ap.security.as_ref().map_or("Unknown".to_string(), |s| format!("{:?}", s)));
-                    }
-                    println!();
-                }
-
-                for frame in &frames {
-                    if let Some(payload) = &frame.payload {
-                        if payload.len() > 0 {
-                            let ap_name = if let Some(bssid) = &frame.bssid {
-                                if mac_to_ssid.contains_key(bssid) {
-                                    format!("{} ({})", bssid, mac_to_ssid.get(bssid).unwrap())
-                                } else {
-                                    bssid.clone()
-                                }
-                            } else {
-                                "Unknown AP".to_string()
-                            };
-                            
-                            println!("\nDATA PACKET: {} → {} via {}", 
-                                    frame.mac_src, frame.mac_dst, ap_name);
-                            println!("  Length: {} bytes", frame.frame_length);
-                            println!("  Sequence: {}", frame.sequence_number.unwrap_or(0));
-                            
-                            println!("  Analysis:");
-                            let insights = analyze_data_packet(frame);
-                            for insight in insights {
-                                println!("    • {}", insight);
-                            }
-                            
-                            println!("  Payload (first 48 bytes):");
-                            print_hex_dump(&payload[..std::cmp::min(48, payload.len())]);
-                            println!();
+                            println!("Interface restored to managed mode");
                         }
+                        return Ok(());
                     }
-                }
-
-                // Process for decryption
-                for frame in &frames {
-                    // Display decrypted data
-                    if let Some(decrypted) = decryptor.process_packet(frame, &mac_to_ssid) {
-                        println!("\n DECRYPTED PACKET: {} → {} via {}", 
-                                frame.mac_src, frame.mac_dst, 
-                                frame.bssid.as_ref().unwrap_or(&"Unknown".to_string()));
-                        println!("  Original Length: {} bytes, Decrypted Length: {} bytes", 
-                                frame.frame_length, decrypted.len());
-                        
-                        println!("  Decrypted Data Hex Dump:");
-                        print_hex_dump(&decrypted[..std::cmp::min(64, decrypted.len())]);
-                        
-                        println!("\n  Decrypted Text:");
-                        let printable: String = decrypted.iter()
-                            .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
-                            .collect();
-                        println!("    {}", printable);
-                        
-                        if decrypted.len() >= 14 {
-                            let eth_type = ((decrypted[12] as u16) << 8) | (decrypted[13] as u16);
-                            match eth_type {
-                                0x0800 => {
-                                    println!("  IPv4 Packet");
-                                    if decrypted.len() >= 34 {
-                                        let src_ip = format!("{}.{}.{}.{}", 
-                                                    decrypted[26], decrypted[27], decrypted[28], decrypted[29]);
-                                        let dst_ip = format!("{}.{}.{}.{}", 
-                                                    decrypted[30], decrypted[31], decrypted[32], decrypted[33]);
-                                        println!("    Source IP: {}", src_ip);
-                                        println!("    Destination IP: {}", dst_ip);
-                                        
-                                        let ip_header_len = (decrypted[14] & 0x0F) * 4;
-                                        let protocol = decrypted[23];
-                                        match protocol {
-                                            6 => {
-                                                println!("    TCP Packet");
-                                                if decrypted.len() >= 14 + ip_header_len as usize + 4 {
-                                                    let tcp_offset = 14 + ip_header_len as usize;
-                                                    let src_port = ((decrypted[tcp_offset] as u16) << 8) | 
-                                                                  (decrypted[tcp_offset+1] as u16);
-                                                    let dst_port = ((decrypted[tcp_offset+2] as u16) << 8) | 
-                                                                  (decrypted[tcp_offset+3] as u16);
-                                                    println!("    Ports: {} → {}", src_port, dst_port);
-                                                    
-                                                    match dst_port {
-                                                        80 => println!("    HTTP Traffic"),
-                                                        443 => println!("    HTTPS Traffic"),
-                                                        53 => println!("    DNS Traffic"),
-                                                        _ => {}
-                                                    }
-                                                }
-                                            },
-                                            17 => println!("    UDP Packet"),
-                                            1 => println!("    ICMP Packet"),
-                                            _ => println!("    Protocol: {}", protocol),
-                                        }
-                                    }
-                                },
-                                0x0806 => println!("  ARP Packet"),
-                                0x86DD => println!("  IPv6 Packet"),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if decryptor.network_keys.len() > 0 {
-                    current_filter = build_capture_filter(&decryptor, &mac_to_ssid);
                 }
             },
             Err(e) => {
@@ -313,28 +199,189 @@ async fn main() -> Result<(), String> {
     }
 }
 
-// Interface finder thingy
-fn find_wifi_interface() -> Option<String> {
-    let devices = match Device::list() {
-        Ok(devices) => devices,
-        Err(_) => return None,
+fn print_usage(program_name: &str) {
+    println!("Usage: {} [OPTIONS] [INTERFACE]", program_name);
+    println!("Options:");
+    println!("  -i, --interface <iface>   Specify WiFi interface to use");
+    println!("  -w, --write <file>        Save captured packets to file");
+    println!("  -f, --filter <expr>       Set capture filter");
+    println!("  -d, --display-filter <expr>  Set display filter");
+    println!("  -c, --count <num>         Capture num packets and exit");
+    println!("  -h, --help                Show this help message");
+    println!("\nExamples:");
+    println!("  {} wlan1                  Capture on wlan1", program_name);
+    println!("  {} -i wlan1 -w capture.pcap  Save to file", program_name);
+    println!("  {} -f \"wlan type mgt\"      Filter management frames", program_name);
+}
+
+// PCAP file creation for logging data and other stuff
+fn create_pcap_file(file_path: &str) -> Result<BufWriter<File>, String> {
+    let file = File::create(file_path)
+        .map_err(|e| format!("Failed to create capture file: {}", e))?;
+    
+    let mut writer = BufWriter::new(file);
+    
+    writer.write_all(&[0xa1, 0xb2, 0xc3, 0xd4]).map_err(|e| e.to_string())?;
+    writer.write_all(&[2, 0]).map_err(|e| e.to_string())?;
+    writer.write_all(&[4, 0]).map_err(|e| e.to_string())?;
+    writer.write_all(&[0, 0, 0, 0]).map_err(|e| e.to_string())?;
+    writer.write_all(&[0, 0, 0, 0]).map_err(|e| e.to_string())?;
+    writer.write_all(&[0xff, 0xff, 0, 0]).map_err(|e| e.to_string())?;
+    writer.write_all(&[127, 0, 0, 0]).map_err(|e| e.to_string())?;
+    
+    Ok(writer)
+}
+
+fn write_packet_to_pcap(writer: &mut BufWriter<File>, packet_data: &[u8]) -> Result<(), String> {
+    let now = std::time::SystemTime::now();
+    let duration = now.duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    
+    let ts_sec = duration.as_secs() as u32;
+    writer.write_all(&ts_sec.to_le_bytes()).map_err(|e| e.to_string())?;
+    
+    let ts_usec = duration.subsec_micros();
+    writer.write_all(&ts_usec.to_le_bytes()).map_err(|e| e.to_string())?;
+    
+    let caplen = packet_data.len() as u32;
+    writer.write_all(&caplen.to_le_bytes()).map_err(|e| e.to_string())?;
+    
+    writer.write_all(&caplen.to_le_bytes()).map_err(|e| e.to_string())?;
+    
+    writer.write_all(packet_data).map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+fn matches_display_filter(frame: &ParsedFrame, filter: &str) -> bool {
+    let filter = filter.to_lowercase();
+    
+    if filter.contains("type") {
+        match &frame.frame_type {
+            FrameType::Management(_) if filter.contains("management") || filter.contains("mgt") => return true,
+            FrameType::Control(_) if filter.contains("control") || filter.contains("ctl") => return true,
+            FrameType::Data(_) if filter.contains("data") => return true,
+            _ => {}
+        }
+    }
+    
+    if let Some(ref mac_src) = frame.mac_src {
+        if filter.contains(mac_src) {
+            return true;
+        }
+    }
+    
+    if let Some(ref mac_dst) = frame.mac_dst {
+        if filter.contains(mac_dst) {
+            return true;
+        }
+    }
+    
+    if let Some(ref bssid) = frame.bssid {
+        if filter.contains(bssid) {
+            return true;
+        }
+    }
+    
+    if let Some(ref ssid) = frame.ssid {
+        if filter.contains(ssid) {
+            return true;
+        }
+    }
+    
+    filter.is_empty()
+}
+
+fn display_wireshark_style(num: usize, frame: &ParsedFrame) {
+    let timestamp = Local::now().format("%H:%M:%S%.6f").to_string();
+    
+    let source = frame.mac_src.clone().unwrap_or_else(|| "??:??:??:??:??:??".to_string());
+    let dest = frame.mac_dst.clone().unwrap_or_else(|| "??:??:??:??:??:??".to_string());
+    
+    let length = frame.frame_length;
+    
+    let protocol = match &frame.frame_type {
+        FrameType::Management(subtype) => format!("802.11 Mgmt {}", format_mgmt_subtype(subtype)),
+        FrameType::Control(subtype) => format!("802.11 Ctrl {:?}", subtype),
+        FrameType::Data(subtype) => format!("802.11 Data {:?}", subtype),
+        FrameType::Extension(subtype) => format!("802.11 Ext {:?}", subtype),
     };
     
-    for device in &devices {
-        let name = &device.name;
-        if name.starts_with("wlan") && name != "wlan0" {
-            return Some(name.clone());
-        }
-    }
+    let info = get_frame_info(frame);
     
-    for device in devices {
-        let name = device.name;
-        if name.starts_with("wlan") || name.contains("wl") {
-            return Some(name);
-        }
+    println!("{:<4} {:<19} {:<19} {:<19} {:<8} {:<10} {:<30}", 
+             num, timestamp, source, dest, length, protocol, info);
+}
+
+fn format_mgmt_subtype(subtype: &ManagementSubtype) -> String {
+    match subtype {
+        ManagementSubtype::Beacon => "Beacon".to_string(),
+        ManagementSubtype::ProbeRequest => "Probe Req".to_string(),
+        ManagementSubtype::ProbeResponse => "Probe Resp".to_string(),
+        ManagementSubtype::Authentication => "Auth".to_string(),
+        ManagementSubtype::Deauthentication => "Deauth".to_string(),
+        ManagementSubtype::AssociationRequest => "Assoc Req".to_string(),
+        ManagementSubtype::AssociationResponse => "Assoc Resp".to_string(),
+        ManagementSubtype::ReassociationRequest => "Reassoc Req".to_string(),
+        ManagementSubtype::ReassociationResponse => "Reassoc Resp".to_string(),
+        ManagementSubtype::Disassociation => "Disassoc".to_string(),
+        _ => format!("{:?}", subtype),
     }
-    
-    None
+}
+
+fn get_frame_info(frame: &ParsedFrame) -> String {
+    match &frame.frame_type {
+        FrameType::Management(ManagementSubtype::Beacon) => {
+            if let Some(ref ssid) = frame.ssid {
+                if ssid == "<hidden>" {
+                    format!("BSSID: {}", frame.bssid.as_deref().unwrap_or("??"))
+                } else {
+                    format!("SSID: {}", ssid)
+                }
+            } else {
+                "Beacon frame".to_string()
+            }
+        },
+        FrameType::Management(ManagementSubtype::ProbeRequest) => {
+            if let Some(ref ssid) = frame.ssid {
+                if ssid.is_empty() {
+                    "Wildcard Probe Request".to_string()
+                } else {
+                    format!("Probe Request for \"{}\"", ssid)
+                }
+            } else {
+                "Probe Request".to_string()
+            }
+        },
+        FrameType::Management(ManagementSubtype::ProbeResponse) => {
+            if let Some(ref ssid) = frame.ssid {
+                format!("Probe Response for \"{}\"", ssid)
+            } else {
+                "Probe Response".to_string()
+            }
+        },
+        FrameType::Management(ManagementSubtype::Deauthentication) => {
+            format!("Deauthentication, BSSID: {}", 
+                    frame.bssid.as_deref().unwrap_or("??"))
+        },
+        FrameType::Data(_) => {
+            if let Some(ref payload) = frame.payload {
+                if payload.len() > 0 {
+                    let mut insights = analyze_data_packet(frame);
+                    if !insights.is_empty() {
+                        insights.first().unwrap().clone()
+                    } else {
+                        format!("Data, {} bytes", frame.frame_length)
+                    }
+                } else {
+                    format!("Data, {} bytes", frame.frame_length)
+                }
+            } else {
+                format!("Data, {} bytes", frame.frame_length)
+            }
+        },
+        _ => format!("{:?}", frame.frame_type),
+    }
 }
 
 fn channel_hopping(interface: &str) {
@@ -374,6 +421,30 @@ fn channel_hopping(interface: &str) {
             }
         }
     }
+}
+
+// Interface finder thingy
+fn find_wifi_interface() -> Option<String> {
+    let devices = match Device::list() {
+        Ok(devices) => devices,
+        Err(_) => return None,
+    };
+    
+    for device in &devices {
+        let name = &device.name;
+        if name.starts_with("wlan") && name != "wlan0" {
+            return Some(name.clone());
+        }
+    }
+    
+    for device in devices {
+        let name = device.name;
+        if name.starts_with("wlan") || name.contains("wl") {
+            return Some(name);
+        }
+    }
+    
+    None
 }
 
 fn lock_to_channel(interface_name: &str, channel: u8) -> Result<(), String> {
